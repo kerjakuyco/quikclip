@@ -1,0 +1,40 @@
+{
+  "name": "quikclip",
+  "version": "0.1.0",
+  "description": "Local-first video clip editor with a native Tauri desktop workspace and AI highlights.",
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kerjakuyco/quikclip.git"
+  },
+  "bugs": "https://github.com/kerjakuyco/quikclip/issues",
+  "funding": "https://github.com/sponsors/kerjakuyco",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "format:check": "prettier --check src tests playwright.config.ts vite.config.ts",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "test": "playwright test"
+  },
+  "dependencies": {
+    "@fontsource-variable/manrope": "^5.3.0",
+    "@tauri-apps/api": "^2.8.0",
+    "lucide-react": "^0.468.0",
+    "mediabunny": "^1.66.2",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.65.1",
+    "@tauri-apps/cli": "^2.8.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "prettier": "^3.10.1",
+    "typescript": "~5.9.3",
+    "vite": "^7.1.0"
+  }
+}

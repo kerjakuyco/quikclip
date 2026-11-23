@@ -1,0 +1,26 @@
+name: Bug report
+description: Report a problem with the editor, import, analysis, or export.
+title: "Bug: "
+body:
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, Quikclip version or commit, and desktop app or browser.
+      placeholder: Windows 11, main at abc1234, desktop app
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Can you reproduce it with the bundled Alpine field notes project?
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Expected and actual result
+      description: Include the on-screen error or a screenshot if it helps.
+    validations:
+      required: true

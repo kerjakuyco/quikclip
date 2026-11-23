@@ -1,0 +1,18 @@
+name: Feature request
+description: Suggest an improvement to the editing workflow.
+title: "Feature: "
+body:
+  - type: textarea
+    id: workflow
+    attributes:
+      label: What are you trying to edit or make?
+      description: Describe the workflow and where it slows you down.
+    validations:
+      required: true
+  - type: textarea
+    id: improvement
+    attributes:
+      label: What would a good result look like?
+      description: A concrete example, mockup, or before-and-after is welcome.
+    validations:
+      required: true
