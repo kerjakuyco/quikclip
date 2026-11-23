@@ -1,8 +1,7 @@
 use crate::media::{probe, run, source, valid_range, Result};
+use crate::providers::{Connection, Session};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
 #[derive(Serialize, Deserialize)]
@@ -12,31 +11,14 @@ pub struct Suggestion {
     end: f64,
 }
 
-pub async fn find_highlights(app: AppHandle, id: String) -> Result<Vec<Suggestion>> {
-    let model = std::env::var("QUIKCLIP_MODEL").unwrap_or_else(|_| "gemma3:4b".into());
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(300))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let tags = client
-        .get("http://127.0.0.1:11434/api/tags")
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-        .map_err(|_| "Start Ollama on this device, then try again.")?
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|_| "Ollama returned an unexpected response.")?;
-    if !tags["models"]
-        .as_array()
-        .is_some_and(|m| m.iter().any(|m| m["name"] == model))
-    {
-        return Err(format!(
-            "Install the local vision model with: ollama pull {model}"
-        ));
-    }
+pub async fn find_highlights(
+    app: AppHandle,
+    id: String,
+    connection: Connection,
+    model: String,
+) -> Result<Vec<Suggestion>> {
+    let name = connection.label();
+    let session = Session::new(connection, None).await?;
     let path = source(&app, &id)?;
     let (duration, ..) = probe(&path).await?;
     let work = tempfile::tempdir().map_err(|e| e.to_string())?;
@@ -100,24 +82,24 @@ pub async fn find_highlights(app: AppHandle, id: String) -> Result<Vec<Suggestio
     .await?;
     let _ = app.emit(
         "studio-progress",
-        "Finding highlights with the local vision model…",
+        format!("Finding highlights with {name}…"),
     );
     let prompt = format!("You are a film editor. This 3 by 3 contact sheet shows frames read left to right, then top to bottom, at seconds {} of a {duration:.2} second video. Pick up to three distinct, visually interesting, non-overlapping clips grounded in these frames. Give each a specific short title, start and end in seconds. Use only times inside the source. Return JSON: {{\"clips\":[{{\"title\":\"...\",\"start\":0.0,\"end\":1.0}}]}}.",times.join(", "));
-    let response = client.post("http://127.0.0.1:11434/api/generate")
-        .json(&json!({"model":model,"stream":false,"format":"json","images":[STANDARD.encode(sheet)],"prompt":prompt,"options":{"temperature":0.2}}))
-        .send().await.map_err(|_| "Local analysis did not finish. Check Ollama and try a smaller vision model.")?;
-    if !response.status().is_success() {
-        return Err("Ollama could not analyze these frames. Check the model's vision support and available memory.".into());
-    }
-    let data: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|_| "Invalid Ollama response.")?;
+    let response = session
+        .generate(&model, &prompt, STANDARD.encode(sheet))
+        .await?;
+    let text = response.trim();
+    let text = text
+        .strip_prefix("```json")
+        .or_else(|| text.strip_prefix("```"))
+        .and_then(|s| s.strip_suffix("```"))
+        .unwrap_or(text)
+        .trim();
     #[derive(Deserialize)]
     struct Answer {
         clips: Vec<Suggestion>,
     }
-    let answer: Answer = serde_json::from_str(data["response"].as_str().unwrap_or(""))
+    let answer: Answer = serde_json::from_str(text)
         .map_err(|_| "The model could not identify usable clips. Try again.")?;
     let mut clips: Vec<Suggestion> = Vec::new();
     for mut c in answer.clips {

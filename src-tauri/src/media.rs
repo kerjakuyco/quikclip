@@ -27,8 +27,27 @@ pub struct Media {
     fps: f64,
 }
 
+fn tool_path(tool: &str) -> Result<PathBuf> {
+    let suffix = std::env::consts::EXE_SUFFIX;
+    #[cfg(test)]
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("binaries")
+        .join(format!(
+            "quikclip-{tool}-{}{suffix}",
+            env!("QUIKCLIP_TARGET")
+        ));
+    #[cfg(not(test))]
+    let path = std::env::current_exe()
+        .map_err(|e| e.to_string())?
+        .with_file_name(format!("quikclip-{tool}{suffix}"));
+    if !path.is_file() {
+        return Err(format!("Quikclip’s bundled {tool} is missing. Reinstall the desktop app to restore its media tools."));
+    }
+    Ok(path)
+}
+
 pub async fn run(tool: &str, args: &[&str], seconds: u64) -> Result<Vec<u8>> {
-    let mut command = Command::new(tool);
+    let mut command = Command::new(tool_path(tool)?);
     command
         .args(args)
         .kill_on_drop(true)
@@ -40,7 +59,7 @@ pub async fn run(tool: &str, args: &[&str], seconds: u64) -> Result<Vec<u8>> {
         .map_err(|_| format!("{tool} timed out. Try a shorter video."))?
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                format!("Install {tool} and add it to your PATH, then restart Quikclip.")
+                format!("The bundled {tool} could not be opened. Reinstall Quikclip to restore its media tools.")
             } else {
                 format!("Could not start {tool}: {e}")
             }
@@ -284,11 +303,19 @@ fn youtube(input: &str) -> Result<String> {
 
 pub async fn import_youtube(app: AppHandle, url: String) -> Result<Media> {
     let url = youtube(&url)?;
+    let ffmpeg = tool_path("ffmpeg")?;
+    let js = format!("quickjs:{}", text(&tool_path("qjs")?)?);
     let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
     let output = run(
         "yt-dlp",
         &[
             "--ignore-config",
+            "--no-plugin-dirs",
+            "--no-js-runtimes",
+            "--js-runtimes",
+            &js,
+            "--ffmpeg-location",
+            text(&ffmpeg)?,
             "--no-playlist",
             "--no-progress",
             "--quiet",

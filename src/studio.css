@@ -1684,3 +1684,64 @@ kbd {
     animation: none;
   }
 }
+.provider-panel,
+.connection-form {
+  display: grid;
+  gap: 12px;
+}
+.provider-panel p {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.65;
+}
+.provider-panel .subnote {
+  margin: 0;
+}
+.provider-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+.provider-grid button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px;
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--raised);
+  font-size: 12px;
+}
+.provider-grid span {
+  flex: 1;
+}
+.provider-grid small {
+  display: block;
+  font-size: 10px;
+  color: var(--muted);
+}
+.provider-grid button[aria-pressed='true'] {
+  background: #362720;
+  color: #ffb69b;
+  border-color: #84563e;
+}
+.provider-actions,
+.connection-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+.provider-panel select {
+  width: 100%;
+  background: var(--bg);
+  color: inherit;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px;
+}
+.connection-label {
+  font-size: 11px;
+  color: var(--green);
+}

@@ -34,3 +34,5 @@ playwright-report/
 !.env.example
 .DS_Store
 Thumbs.db
+src-tauri/binaries/
+src-tauri/tool-notices/

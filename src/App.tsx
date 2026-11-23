@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { ProviderPanel, type Connection } from './components/ProviderPanel';
 import { listen } from '@tauri-apps/api/event';
 import {
   ArrowDownToLine,
@@ -295,11 +296,13 @@ export default function App() {
       },
     );
   }
-  async function analyze() {
-    await action('Analyzing frames on this device…', async () => {
-      if (!desktop) throw Error('Open the desktop app to connect to your local Ollama model.');
+  async function analyze(connection: Connection, model: string) {
+    await action('Preparing source frames…', async () => {
+      if (!desktop) throw Error('Open the desktop app to connect your AI provider.');
       const results = await invoke<Pick<Cut, 'start' | 'end' | 'title'>[]>('find_highlights', {
         id: p.id,
+        connection,
+        model,
       });
       const clips: Cut[] = results.map((c) => ({ ...c, id: newId(), shape: 'source' }));
       edit((s) => ({ ...s, selected: clips[0].id, cuts: [...s.cuts, ...clips] }));
@@ -712,7 +715,7 @@ export default function App() {
       )}
       {modal && (
         <Dialog
-          eyebrow={modal === 'ai' ? 'LOCAL INTELLIGENCE' : 'QUIKCLIP STUDIO'}
+          eyebrow={modal === 'ai' ? 'AI CONNECTIONS' : 'QUIKCLIP STUDIO'}
           title={
             {
               import: 'Import media',
@@ -812,7 +815,7 @@ export default function App() {
                       />
                     </div>
                   </label>
-                  <p className="subnote">Single videos and Shorts · Desktop app with yt-dlp</p>
+                  <p className="subnote">Single videos and Shorts · Built-in desktop importer</p>
                   <button className="btn primary wide" disabled={!!busy || !url.trim()}>
                     <Download size={16} />
                     Import video
@@ -821,27 +824,7 @@ export default function App() {
               )}
             </>
           )}
-          {modal === 'ai' && (
-            <>
-              <p>
-                Analyze nine frames from your source and suggest up to three visual highlights. New
-                cuts are added to your clip bin.
-              </p>
-              <div className="info-block">
-                <Sparkles />
-                <div>
-                  <strong>Local vision model</strong>
-                  <p>Run Ollama on this device and install the default model:</p>
-                  <code>ollama pull gemma3:4b</code>
-                </div>
-              </div>
-              <p className="subnote">Frames stay on your device. Requires the desktop app.</p>
-              <button disabled={!!busy} className="btn primary wide" onClick={analyze}>
-                <Sparkles size={16} />
-                Analyze source
-              </button>
-            </>
-          )}
+          {modal === 'ai' && <ProviderPanel busy={!!busy} analyze={analyze} />}
           {modal === 'export' && (
             <>
               <p>Render the selected range with your output frame.</p>
@@ -901,7 +884,7 @@ export default function App() {
                 [
                   Upload,
                   'Bring in a source',
-                  'Use Import media for local files or a YouTube link. Desktop imports use FFmpeg and ffprobe; YouTube also needs yt-dlp on your PATH.',
+                  'Use Import media for a local video or YouTube link. The desktop app includes the tools for downloading, preparing, and exporting footage.',
                 ],
                 [
                   Scissors,
@@ -911,7 +894,7 @@ export default function App() {
                 [
                   Sparkles,
                   'Find a highlight',
-                  'Highlight finder uses a local Ollama vision model. The sample project includes three editorial cuts you can try right away.',
+                  'Choose a local or cloud provider in Highlight finder, connect, and select a vision model. The sample project includes three cuts you can try right away.',
                 ],
                 [
                   Download,

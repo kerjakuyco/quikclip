@@ -28,10 +28,11 @@ npm run build
 npx playwright install chromium
 npm test
 cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+npm run prepare:tools
 cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
 ```
 
-The native media tests require `ffmpeg` and `ffprobe` on `PATH`. For tests on Windows you can use the installed Edge browser by setting `PLAYWRIGHT_CHANNEL=msedge`. YouTube and Ollama are optional for the test suite.
+Native tests use the verified binaries staged by `prepare:tools`; user machines need no media tools on `PATH`. The Tauri dev/build hooks run this step automatically. To update a tool, change the pinned release in `scripts/pin-tools.mjs`, regenerate and review `scripts/tools.lock.json`, update its notices, and rebuild the desktop packages. For tests on Windows you can use installed Edge by setting `PLAYWRIGHT_CHANNEL=msedge`. Live AI credentials are not required for the test suite.
 
 In your pull request, explain what changed for the editor, the OS you tested, and how to reproduce or verify the result. A screenshot or short recording is particularly helpful for timeline and layout changes. Use the bundled sample or media you have permission to share.
 

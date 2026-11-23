@@ -40,13 +40,5 @@ jobs:
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
       - run: npm run build
       - run: npm test
-      - name: Install FFmpeg if missing
-        shell: pwsh
-        run: |
-          if (!(Get-Command ffmpeg -ErrorAction SilentlyContinue) -or !(Get-Command ffprobe -ErrorAction SilentlyContinue)) {
-            choco install ffmpeg -y --no-progress
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
-          ffmpeg -version
-          ffprobe -version
+      - run: npm run prepare:tools
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib

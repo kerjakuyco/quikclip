@@ -76,7 +76,7 @@ export function Inspector({
         </span>
         <div>
           <strong>Highlight finder</strong>
-          <p>Discover standout moments with local AI.</p>
+          <p>Find standout moments with your AI model.</p>
         </div>
         <button onClick={analyze}>
           <Sparkles size={14} /> Find highlights <ArrowUpRight size={14} />

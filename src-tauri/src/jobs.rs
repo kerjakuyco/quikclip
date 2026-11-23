@@ -58,8 +58,11 @@ pub async fn find_highlights(
     app: AppHandle,
     jobs: State<'_, Jobs>,
     id: String,
+    connection: crate::providers::Connection,
+    model: String,
 ) -> Result<Vec<ai::Suggestion>> {
-    jobs.process(ai::find_highlights(app, id)).await
+    jobs.process(ai::find_highlights(app, id, connection, model))
+        .await
 }
 
 #[tauri::command]

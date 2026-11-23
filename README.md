@@ -4,7 +4,7 @@
 [![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue)](LICENSE)
 [![GitHub Sponsors](https://img.shields.io/badge/Sponsor-%40kerjakuyco-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/kerjakuyco)
 
-**Turn a long video into a short, shareable clip on your own machine.** Import a file or YouTube video, pick highlights manually or with a local vision model, and export a landscape, square, or portrait cut.
+**Turn a long video into a short, shareable clip on your own machine.** Import a file or YouTube video, find highlights manually or with your choice of local or cloud AI, and export a landscape, square, or portrait cut.
 
 Quikclip is an open-source desktop app built with Tauri 2, Rust, React, and TypeScript for Windows, macOS, and Linux. The bundled *Alpine field notes* project lets you try the editor immediately.
 
@@ -12,9 +12,9 @@ Quikclip is an open-source desktop app built with Tauri 2, Rust, React, and Type
 
 ## Run the desktop app
 
-1. Install Node.js 22.12+ (or current LTS), stable Rust, and the [Tauri desktop prerequisites for your OS](https://v2.tauri.app/start/prerequisites/).
-2. Install [FFmpeg](https://ffmpeg.org/download.html) with `ffmpeg`, `ffprobe`, H.264 encoding (`libx264`), and AAC support. Add both executables to the app's `PATH`.
-3. For YouTube imports, install the current [yt-dlp](https://github.com/yt-dlp/yt-dlp#installation) and its [YouTube JavaScript runtime dependencies](https://github.com/yt-dlp/yt-dlp/wiki/EJS). Local files do not require yt-dlp.
+**Installed app:** Open **Import media → YouTube URL**, paste a video link, and choose **Import video**. The installer includes yt-dlp, its JavaScript runtime, FFmpeg, and ffprobe. No separate downloader, Python installation, or `PATH` setup is needed.
+
+**From source:** Install Node.js 22.12+ (or current LTS), stable Rust, and the [Tauri desktop prerequisites for your OS](https://v2.tauri.app/start/prerequisites/), then run:
 
 ```sh
 git clone https://github.com/kerjakuyco/quikclip.git
@@ -23,7 +23,7 @@ npm ci
 npm run tauri dev
 ```
 
-On macOS, if the desktop launcher cannot find Homebrew tools, start Quikclip from a terminal with the Homebrew `bin` directory on `PATH`. Linux needs WebKitGTK 4.1 and GStreamer H.264/AAC playback plugins in addition to FFmpeg.
+The first desktop build downloads and verifies pinned tools for the target. Later builds reuse the verified copies. Linux uses WebKitGTK 4.1, GStreamer H.264/AAC playback plugins, and (for saved API tokens) a Secret Service keyring.
 
 ## Edit a clip
 
@@ -41,17 +41,20 @@ On macOS, if the desktop launcher cannot find Homebrew tools, start Quikclip fro
 | M | Mute the monitor |
 | ? | Show shortcuts |
 
-## Local AI highlight finder
+## Connect an AI provider
 
-Install [Ollama](https://ollama.com/download), start its local service, and pull the vision model:
+In the desktop app, choose **Find highlights → provider → Connect & load models**. Select a vision model and click **Analyze source**. The studio remembers the model for each provider. **Edit connection**, **Refresh models**, and **Forget connection** are available in the same panel.
 
-```sh
-ollama pull gemma3:4b
-```
+| Provider | Connection details | Model selection |
+| --- | --- | --- |
+| Ollama · local | Start Ollama on port `11434`, or enter its local port. Try `ollama pull gemma3:4b`. | Installed models advertising vision; cloud-backed models are excluded. |
+| LM Studio · local | Start the server in the Developer tab (normally port `1234`). Enter a server token if authentication is enabled. | Locally served vision LLMs reported by `/api/v1/models`. |
+| OpenRouter · cloud | Enter an [OpenRouter API key](https://openrouter.ai/settings/keys). | Live catalog of image-input, text-output chat models. |
+| Cloudflare AI Gateway · cloud | Enter your account ID, gateway ID (`default` is supported), and an API token with **Account → Workers AI → Read**. | Discover Workers AI vision models, or choose **Other gateway model** and enter a supported `author/model` ID. See [Cloudflare's routing and billing guide](https://developers.cloudflare.com/ai-gateway/usage/rest-api/). |
 
-Click **Find highlights → Analyze source**. Rust samples nine frames across the source, builds a contact sheet, and asks Ollama at `127.0.0.1:11434` for timestamped suggestions. Quikclip validates the ranges and adds up to three named cuts without replacing existing work. This is visual analysis, not speech transcription. The sample project's three initial cuts are curated examples.
+Quikclip sends a single nine-frame contact sheet and timestamps to the selected provider, then adds up to three validated cuts to the clip bin. Connecting or refreshing models does not send footage. Local providers use loopback; choosing cloud analysis sends the sampled frames to that service. The source video and audio are not uploaded.
 
-To use another installed vision model, set `QUIKCLIP_MODEL` to its exact Ollama tag before launching the app. No hosted account or API key is required.
+Tokens are stored in Windows Credential Manager, macOS Keychain, or Linux Secret Service. Project storage contains no API keys. `QUIKCLIP_MODEL` is still honored as the initial Ollama preference when that vision model is installed.
 
 ## Browser preview
 
@@ -59,7 +62,7 @@ To use another installed vision model, set `QUIKCLIP_MODEL` to its exact Ollama 
 npm run dev
 ```
 
-Visit `http://127.0.0.1:1420`. The browser can play the sample, import browser-decodable local files, keep media in IndexedDB, edit cuts, and export WebM with WebCodecs and Mediabunny. YouTube downloads, local-model analysis, and native MP4 rendering run in the desktop build.
+Visit `http://127.0.0.1:1420`. The browser can play the sample, import browser-decodable local files, keep media in IndexedDB, edit cuts, and export WebM with WebCodecs and Mediabunny. YouTube downloads, AI analysis, and native MP4 rendering run in the desktop build.
 
 ## Packaging and checks
 
@@ -67,12 +70,13 @@ Visit `http://127.0.0.1:1420`. The browser can play the sample, import browser-d
 npm run tauri build
 ```
 
-Build on the target OS to produce its installers under `src-tauri/target/release/bundle/`. The **Desktop packages** workflow can build Windows, macOS, and Linux artifacts on their native runners. These developer packages are unsigned. Media tools and model weights are installed separately.
+Build on the target OS to produce installers under `src-tauri/target/release/bundle/`. The **Desktop packages** workflow builds Windows x64, macOS, and Linux packages on native runners. These developer packages are unsigned. Media executables are shipped as namespaced Tauri sidecars; sources and notices are documented in [THIRD_PARTY_TOOLS.md](THIRD_PARTY_TOOLS.md). Local AI model weights are managed by your chosen provider.
 
 ```sh
 npm run build
 npx playwright install chromium
 npm test
+npm run prepare:tools
 cargo test --manifest-path src-tauri/Cargo.toml --lib
 ```
 
@@ -84,7 +88,7 @@ On Windows, `node scripts/smoke-windows.mjs` verifies sample playback and native
 
 - `src/` — editing workspace, source monitor, timeline, clip settings, local storage, browser media adapter.
 - `src-tauri/src/media.rs` — native file dialogs, URL canonicalization, bounded media subprocesses, import and atomic export.
-- `src-tauri/src/ai.rs` — local vision inference and suggestion validation.
+- `src-tauri/src/ai.rs`, `providers.rs` — contact sheet extraction, provider discovery and inference, native credential storage, and suggestion validation.
 - `src-tauri/src/jobs.rs` — single active media job, asynchronous dispatch and cancellation.
 - `public/sample/` — bundled, offline sample film. Credits in [CREDITS.md](CREDITS.md).
 
