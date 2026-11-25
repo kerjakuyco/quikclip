@@ -2,8 +2,8 @@
 
 Quikclip distributes the following unmodified standalone programs. Exact download URLs and SHA-256 digests for each platform are in `scripts/tools.lock.json` in the Quikclip source. They run as separate processes.
 
-- **yt-dlp** — [2026.10.26 source and release](https://github.com/yt-dlp/yt-dlp/releases/tag/2026.10.26). The official standalone executables include Python and the matching yt-dlp EJS components. See the [upstream license and binary distribution notices](https://github.com/yt-dlp/yt-dlp#license); the standalone builds include GPLv3+ code.
-- **FFmpeg and ffprobe** — [binary distribution, sources and build information](https://github.com/eugeneware/ffmpeg-static/releases/tag/b6.1.1). The platform-specific upstream license and source/build notes accompany the installed app in `notices/ffmpeg.LICENSE` and `notices/ffmpeg.README`.
+- **yt-dlp** — [2026.11.23 source and release](https://github.com/yt-dlp/yt-dlp/releases/tag/2026.11.23). The official standalone executables include Python and the matching yt-dlp EJS components. See the [upstream license and binary distribution notices](https://github.com/yt-dlp/yt-dlp#license); the standalone builds include GPLv3+ code.
+- **FFmpeg and ffprobe** — version 6.1.1. On Windows, `ffmpeg` is the gyan.dev full build ([release and archive](https://github.com/GyanD/codexffmpeg/releases/tag/6.1.1), which includes the dav1d AV1 decoder); every other binary comes from the [ffmpeg-static b6.1.1 distribution, sources and build information](https://github.com/eugeneware/ffmpeg-static/releases/tag/b6.1.1). The platform-specific upstream license and source/build notes accompany the installed app in `notices/ffmpeg.LICENSE` and `notices/ffmpeg.README`.
 - **QuickJS-NG** — [v0.18.0 release and corresponding source](https://github.com/quickjs-ng/quickjs/releases/tag/v0.18.0). The MIT license text is included with this app; see also the [upstream license](https://github.com/quickjs-ng/quickjs/blob/v0.18.0/LICENSE).
 
 ## QuickJS-NG — MIT License
