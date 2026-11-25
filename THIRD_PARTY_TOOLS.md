@@ -6,6 +6,10 @@ Quikclip distributes the following unmodified standalone programs. Exact downloa
 - **FFmpeg and ffprobe** — version 6.1.1. On Windows, `ffmpeg` is the gyan.dev full build ([release and archive](https://github.com/GyanD/codexffmpeg/releases/tag/6.1.1), which includes the dav1d AV1 decoder); every other binary comes from the [ffmpeg-static b6.1.1 distribution, sources and build information](https://github.com/eugeneware/ffmpeg-static/releases/tag/b6.1.1). The platform-specific upstream license and source/build notes accompany the installed app in `notices/ffmpeg.LICENSE` and `notices/ffmpeg.README`.
 - **QuickJS-NG** — [v0.18.0 release and corresponding source](https://github.com/quickjs-ng/quickjs/releases/tag/v0.18.0). The MIT license text is included with this app; see also the [upstream license](https://github.com/quickjs-ng/quickjs/blob/v0.18.0/LICENSE).
 
+## Noto Sans — SIL Open Font License 1.1
+
+Captions are set in Noto Sans Regular and Bold (`public/fonts`, from [notofonts.github.io at d14cc17](https://github.com/notofonts/notofonts.github.io/tree/d14cc173a70dc57962ed2d4ad278fc9df83bf9f3/fonts/NotoSans/hinted/ttf)), unmodified. Copyright 2022 The Noto Project Authors. The license text accompanies the fonts in `fonts/OFL.txt`.
+
 ## QuickJS-NG — MIT License
 
 ```text
