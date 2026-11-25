@@ -15,7 +15,7 @@
     ],
     "security": {
       "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost blob: data:; media-src 'self' asset: http://asset.localhost blob:; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost asset: http://asset.localhost; object-src 'none'; base-uri 'self'",
-      "assetProtocol": { "enable": true, "scope": ["$APPLOCALDATA/media/*/source.mp4", "$APPLOCALDATA/media/*/frame-*.jpg", "$APPLOCALDATA/media/*/wave.png"] }
+      "assetProtocol": { "enable": true, "scope": ["$APPLOCALDATA/media/*/source.mp4", "$APPLOCALDATA/media/*/frame-*.jpg", "$APPLOCALDATA/media/*/wave.png", "$APPLOCALDATA/media/music/*", "$APPLOCALDATA/media/logos/*"] }
     }
   },
   "bundle": {

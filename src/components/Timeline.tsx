@@ -1,6 +1,6 @@
 import { useRef, type PointerEvent } from 'react';
 import { AudioLines, Film, ListVideo, Plus, Scissors } from 'lucide-react';
-import { asset, clamp, clock, frame, type Cut, type Project } from '../studio';
+import { asset, clamp, clock, desktop, frame, type Cut, type Project } from '../studio';
 
 export function Timeline({
   p,
@@ -83,6 +83,8 @@ export function Timeline({
           <div className="audio-track">
             {p.wave ? (
               <img src={asset(p, p.wave)} draggable={false} alt="Source audio waveform" />
+            ) : desktop && p.id !== 'sample' && p.wave === undefined ? (
+              <span role="status">Drawing the audio waveform…</span>
             ) : (
               <span>Source timeline</span>
             )}

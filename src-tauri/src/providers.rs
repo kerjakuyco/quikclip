@@ -1,5 +1,6 @@
 //! Native provider clients. Only non-secret connection details cross back to the UI.
 use crate::media::Result;
+use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -125,6 +126,7 @@ impl Model {
     }
 }
 
+#[derive(Clone)]
 pub struct Session {
     config: Connection,
     client: Client,
@@ -172,6 +174,12 @@ impl Session {
             token,
         })
     }
+    /// A session aimed at a local stand-in for the provider.
+    #[cfg(test)]
+    pub fn with_base(mut self, base: String) -> Self {
+        self.base = base;
+        self
+    }
     fn req(&self, method: reqwest::Method, suffix: &str) -> RequestBuilder {
         let mut r = self
             .client
@@ -199,17 +207,11 @@ impl Session {
             }
         })?;
         if !res.status().is_success() {
-            let detail = match res.status().as_u16() {
-                401 | 403 => "Check your API token and account permissions.",
-                402 => "Check your provider's billing balance.",
-                404 => "Check the server version, account, gateway, or model ID.",
-                400 | 422 => "Check that the selected model accepts image inputs and is available.",
-                429 => "The rate limit was reached. Try again later.",
-                _ => "Check provider availability and the model configuration.",
-            };
+            let code = res.status().as_u16();
+            let body = res.text().await.unwrap_or_default();
             return Err(format!(
-                "{name} returned {}. {detail}",
-                res.status().as_u16()
+                "{name} returned {code}. {}",
+                provider_failure(code, &body)
             ));
         }
         res.json()
@@ -286,6 +288,81 @@ impl Session {
         models.dedup_by(|a, b| a.id == b.id);
         Ok(models)
     }
+    /// Speech to text for a clip's audio (16 kHz mono MP3) with Whisper large v3 turbo, the model clip-ai transcribes with
+    /// (service/pipeline.py transcription_model). Local providers have no speech model.
+    pub async fn transcribe(&self, mp3: &[u8]) -> Result<Value> {
+        let audio = STANDARD.encode(mp3);
+        let (route, body) = match self.config.provider {
+            // Only endpoints that keep nothing and train on nothing (clip-ai PRIVATE_ROUTING).
+            Provider::OpenRouter => (
+                "/audio/transcriptions",
+                json!({"model":"openai/whisper-large-v3-turbo","input_audio":{"data":audio,"format":"mp3"},
+                       "response_format":"verbose_json","timestamp_granularities":["word","segment"],
+                       "provider":{"zdr":true,"data_collection":"deny"}}),
+            ),
+            Provider::Cloudflare => (
+                "/run/@cf/openai/whisper-large-v3-turbo",
+                json!({"audio":audio,"task":"transcribe"}),
+            ),
+            _ => {
+                return Err(format!(
+                    "{} has no speech-to-text model. Connect OpenRouter or Cloudflare in Highlight finder to make captions.",
+                    self.config.label()
+                ))
+            }
+        };
+        let response = self
+            .json(self.req(reqwest::Method::POST, route).json(&body))
+            .await?;
+        // Cloudflare's REST API wraps the model's answer in {"result": ...}.
+        Ok(match response.get("result") {
+            Some(inner) if inner.is_object() => inner.clone(),
+            _ => response,
+        })
+    }
+    /// A text-only answer (the transcript's highlights): a system brief and the user's text, answered as JSON.
+    pub async fn chat(&self, model: &str, system: &str, user: &str) -> Result<String> {
+        if model.trim().is_empty() || model.len() > 300 || model.chars().any(char::is_control) {
+            return Err("Choose a model.".into());
+        }
+        let messages = json!([{"role":"system","content":system},{"role":"user","content":user}]);
+        let (route, body) = if self.config.provider == Provider::Ollama {
+            // Ollama's default context is a few thousand tokens and silently drops the rest: size it to the transcript.
+            let context = ((system.len() + user.len()) / 3 + 4096).clamp(8192, 131_072);
+            (
+                "/api/chat",
+                json!({"model":model,"stream":false,"format":"json","messages":messages,
+                       "options":{"temperature":0.2,"num_ctx":context}}),
+            )
+        } else {
+            let route = match self.config.provider {
+                Provider::OpenRouter => "/chat/completions",
+                _ => "/v1/chat/completions",
+            };
+            let mut body =
+                json!({"model":model,"stream":false,"temperature":0.2,"messages":messages});
+            if let Some(quick) = quick_answer(self.config.provider, model) {
+                body.as_object_mut().unwrap().extend(quick);
+            }
+            (route, body)
+        };
+        // A long transcript takes a while to read.
+        let res = self
+            .json(
+                self.req(reqwest::Method::POST, route)
+                    .timeout(Duration::from_secs(900))
+                    .json(&body),
+            )
+            .await?;
+        let text = if self.config.provider == Provider::Ollama {
+            res.pointer("/message/content").and_then(Value::as_str)
+        } else {
+            res.pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+        };
+        text.map(str::to_owned)
+            .ok_or_else(|| "The provider returned no highlight suggestions.".into())
+    }
     pub async fn generate(&self, model: &str, prompt: &str, image: String) -> Result<String> {
         if model.trim().is_empty() || model.len() > 300 || model.chars().any(char::is_control) {
             return Err("Choose a vision model.".into());
@@ -305,10 +382,11 @@ impl Session {
                 Provider::OpenRouter => "/chat/completions",
                 _ => "/v1/chat/completions",
             };
-            (
-                route,
-                json!({"model":model,"stream":false,"messages":[{"role":"user","content":[{"type":"text","text":prompt},{"type":"image_url","image_url":{"url":format!("data:image/jpeg;base64,{image}")}}]}]}),
-            )
+            let mut body = json!({"model":model,"stream":false,"messages":[{"role":"user","content":[{"type":"text","text":prompt},{"type":"image_url","image_url":{"url":format!("data:image/jpeg;base64,{image}")}}]}]});
+            if let Some(quick) = quick_answer(self.config.provider, model) {
+                body.as_object_mut().unwrap().extend(quick);
+            }
+            (route, body)
         };
         let res = self
             .json(self.req(reqwest::Method::POST, route).json(&body))
@@ -323,8 +401,54 @@ impl Session {
             .ok_or_else(|| "The provider returned no highlight suggestions.".into())
     }
 }
+/// Workers AI reasoning models think before they answer unless told not to, and that thinking is
+/// most of the wait. The answer here is a few lines of JSON. Gemma 4 can switch thinking off;
+/// Qwen 3.8 defaults to `xhigh` and can only be lowered. Other models get no extra fields.
+fn quick_answer(provider: Provider, model: &str) -> Option<serde_json::Map<String, Value>> {
+    if provider != Provider::Cloudflare {
+        return None;
+    }
+    let extra = if model.starts_with("@cf/google/gemma-4") {
+        json!({"chat_template_kwargs":{"enable_thinking":false}})
+    } else if model.starts_with("@cf/qwen/qwen3.8") {
+        json!({"reasoning_effort":"low"})
+    } else {
+        return None;
+    };
+    extra.as_object().cloned()
+}
+fn provider_failure(code: u16, body: &str) -> String {
+    let message = serde_json::from_str::<Value>(body).ok().and_then(|v| {
+        v["errors"]
+            .get(0)
+            .and_then(|e| e["message"].as_str())
+            .or_else(|| v.pointer("/error/message").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(280).collect())
+    });
+    if let Some(message) = message {
+        return message;
+    }
+    match code {
+        401 | 403 => "Check your API token and account permissions.".into(),
+        402 => "Check your provider's billing balance.".into(),
+        404 => "Check the server version, account, gateway, or model ID.".into(),
+        400 | 422 => "Check that the selected model accepts image inputs and is available.".into(),
+        429 => "The rate limit was reached. Try again later.".into(),
+        _ => "Check provider availability and the model configuration.".into(),
+    }
+}
 fn contains(v: &Value, s: &str) -> bool {
     v.as_array().is_some_and(|a| a.iter().any(|x| x == s))
+}
+/// OpenRouter nests modalities under `architecture`. Cloudflare's openrouter
+/// catalog format puts the same arrays on the model itself.
+fn modalities<'a>(model: &'a Value, kind: &str) -> &'a Value {
+    model
+        .get("architecture")
+        .and_then(|arch| arch.get(kind))
+        .unwrap_or(&model[kind])
 }
 fn catalog(v: &Value) -> Result<Vec<Model>> {
     let rows = v["data"]
@@ -334,8 +458,8 @@ fn catalog(v: &Value) -> Result<Vec<Model>> {
     Ok(rows
         .iter()
         .filter(|m| {
-            contains(&m["architecture"]["input_modalities"], "image")
-                && contains(&m["architecture"]["output_modalities"], "text")
+            contains(modalities(m, "input_modalities"), "image")
+                && contains(modalities(m, "output_modalities"), "text")
         })
         .filter_map(|m| Model::from(m["id"].as_str(), m["name"].as_str()))
         .collect())
@@ -353,12 +477,12 @@ pub async fn connect_ai(connection: Connection, api_key: Option<String>) -> Resu
     if let Some(key) = api_key.filter(|s| !s.trim().is_empty()) {
         credential(&session.config, Secret::Save(key.trim().into())).await?;
     }
-    let preferred_model = if session.config.provider == Provider::Ollama {
-        std::env::var("QUIKCLIP_MODEL")
+    let preferred_model = match session.config.provider {
+        Provider::Ollama => std::env::var("QUIKCLIP_MODEL")
             .ok()
-            .or(Some("gemma3:4b".into()))
-    } else {
-        None
+            .or(Some("gemma3:4b".into())),
+        Provider::Cloudflare => Some("@cf/google/gemma-4-26b-a4b-it".into()),
+        _ => None,
     };
     Ok(Discovery {
         models,
@@ -416,8 +540,12 @@ mod tests {
                 }
                 let data = match path.as_str() {
                     "/key" => json!({"data":{}}),
-                    "/models" | "/models/search" => {
+                    "/models" => {
                         json!({"data":[{"id":"text","architecture":{"input_modalities":["text"],"output_modalities":["text"]}},{"id":"vision","architecture":{"input_modalities":["text","image"],"output_modalities":["text"]}}]})
+                    }
+                    // Cloudflare's openrouter format lists modalities on the model, not under architecture.
+                    "/models/search" => {
+                        json!({"data":[{"id":"text","input_modalities":["text"],"output_modalities":["text"]},{"id":"vision","name":"Vision","input_modalities":["text","image"],"output_modalities":["text"]}]})
                     }
                     "/api/tags" => {
                         json!({"models":[{"name":"vision"},{"name":"remote:cloud"},{"name":"text"}]})
@@ -469,5 +597,163 @@ mod tests {
             );
             worker.join().unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn speech_goes_to_whisper_and_comes_back_as_a_transcript() {
+        for provider in [Provider::OpenRouter, Provider::Cloudflare] {
+            let config = Connection {
+                provider,
+                port: None,
+                account_id: Some("a".repeat(32)),
+                gateway: Some("studio".into()),
+            };
+            let mut session = Session::new(config, Some("fixture-token")).await.unwrap();
+            let server = Server::http("127.0.0.1:0").unwrap();
+            session.base = format!("http://{}", server.server_addr());
+            let worker = std::thread::spawn(move || {
+                let mut req = server
+                    .recv_timeout(Duration::from_secs(8))
+                    .unwrap()
+                    .expect("request");
+                let path = req.url().to_owned();
+                let mut body = String::new();
+                req.as_reader().read_to_string(&mut body).unwrap();
+                let body: Value = serde_json::from_str(&body).unwrap();
+                let answer = if provider == Provider::OpenRouter {
+                    assert_eq!(path, "/audio/transcriptions");
+                    assert_eq!(body["model"], "openai/whisper-large-v3-turbo");
+                    assert_eq!(body["input_audio"], json!({"data":"bXAz","format":"mp3"}));
+                    assert_eq!(body["response_format"], "verbose_json");
+                    assert_eq!(body["timestamp_granularities"], json!(["word", "segment"]));
+                    assert_eq!(body["provider"]["zdr"], true);
+                    json!({"text":"hi","language":"english","words":[{"word":"hi","start":0.1,"end":0.3}]})
+                } else {
+                    assert_eq!(path, "/run/@cf/openai/whisper-large-v3-turbo");
+                    assert_eq!(body, json!({"audio":"bXAz","task":"transcribe"}));
+                    json!({"result":{"text":"hi","segments":[{"start":0.1,"end":0.3,"text":"hi","words":[{"word":"hi","start":0.1,"end":0.3}]}]},"success":true,"errors":[],"messages":[]})
+                };
+                req.respond(Response::from_string(answer.to_string()))
+                    .unwrap();
+            });
+            let transcript = session.transcribe(b"mp3").await.unwrap();
+            assert_eq!(transcript["text"], "hi");
+            assert_eq!(
+                crate::captions::transcript_words(&transcript, 5.0),
+                vec![crate::captions::Word {
+                    start: 5.1,
+                    end: 5.3,
+                    text: "hi".into()
+                }]
+            );
+            worker.join().unwrap();
+        }
+        let local = Session::new(
+            Connection {
+                provider: Provider::Ollama,
+                port: None,
+                account_id: None,
+                gateway: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(local
+            .transcribe(b"mp3")
+            .await
+            .unwrap_err()
+            .contains("no speech-to-text model"));
+    }
+
+    #[tokio::test]
+    async fn a_transcript_is_read_as_text_by_every_provider() {
+        for provider in [
+            Provider::OpenRouter,
+            Provider::Cloudflare,
+            Provider::Ollama,
+            Provider::LmStudio,
+        ] {
+            let config = Connection {
+                provider,
+                port: None,
+                account_id: Some("a".repeat(32)),
+                gateway: None,
+            };
+            let session = Session::new(config, Some("fixture-token")).await.unwrap();
+            let server = Server::http("127.0.0.1:0").unwrap();
+            let session = session.with_base(format!("http://{}", server.server_addr()));
+            let worker = std::thread::spawn(move || {
+                let mut req = server
+                    .recv_timeout(Duration::from_secs(8))
+                    .unwrap()
+                    .expect("request");
+                let path = req.url().to_owned();
+                let mut body = String::new();
+                req.as_reader().read_to_string(&mut body).unwrap();
+                let body: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(body["messages"][0]["role"], "system");
+                assert_eq!(body["messages"][1]["content"], "<transcript>");
+                assert!(body.pointer("/messages/1/content/1").is_none(), "no image");
+                let answer = match provider {
+                    Provider::Ollama => {
+                        assert_eq!(path, "/api/chat");
+                        assert_eq!(body["options"]["num_ctx"], 8192);
+                        json!({"message":{"content":"{\"clips\":[]}"}})
+                    }
+                    Provider::OpenRouter => {
+                        assert_eq!(path, "/chat/completions");
+                        json!({"choices":[{"message":{"content":"{\"clips\":[]}"}}]})
+                    }
+                    _ => {
+                        assert_eq!(path, "/v1/chat/completions");
+                        if provider == Provider::Cloudflare {
+                            assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+                        }
+                        json!({"choices":[{"message":{"content":"{\"clips\":[]}"}}]})
+                    }
+                };
+                req.respond(Response::from_string(answer.to_string()))
+                    .unwrap();
+            });
+            let model = if provider == Provider::Cloudflare {
+                "@cf/google/gemma-4-26b-a4b-it"
+            } else {
+                "vision"
+            };
+            assert_eq!(
+                session.chat(model, "brief", "<transcript>").await.unwrap(),
+                "{\"clips\":[]}"
+            );
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn cloudflare_reasoning_models_answer_without_long_thinking() {
+        let gemma = quick_answer(Provider::Cloudflare, "@cf/google/gemma-4-26b-a4b-it").unwrap();
+        assert_eq!(gemma["chat_template_kwargs"]["enable_thinking"], false);
+        let qwen = quick_answer(Provider::Cloudflare, "@cf/qwen/qwen3.8-27b").unwrap();
+        assert_eq!(qwen["reasoning_effort"], "low");
+        assert!(quick_answer(
+            Provider::Cloudflare,
+            "@cf/meta/llama-3.2-11b-vision-instruct"
+        )
+        .is_none());
+        assert!(quick_answer(Provider::OpenRouter, "google/gemma-4-26b-a4b-it").is_none());
+    }
+
+    #[test]
+    fn a_provider_error_keeps_its_own_message() {
+        let body =
+            r#"{"errors":[{"message":"Model Agreement: submit agree before using this model."}]}"#;
+        assert_eq!(
+            provider_failure(403, body),
+            "Model Agreement: submit agree before using this model."
+        );
+        assert_eq!(
+            provider_failure(403, ""),
+            "Check your API token and account permissions."
+        );
     }
 }

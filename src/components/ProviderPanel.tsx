@@ -34,9 +34,41 @@ export type Connection = {
 };
 type Model = { id: string; name: string };
 type Profile = { connection: Connection; models: Model[]; model: string; custom: boolean };
+/** Keep a typed gateway id that is not in the catalog. An empty custom id does not stick once vision models load. */
+function chosenModel(
+  provider: Provider,
+  profile: Profile | undefined,
+  models: Model[],
+  preferredModel: string | null,
+) {
+  const savedModel = profile?.model ?? '';
+  const listed =
+    [savedModel, preferredModel, models[0]?.id].find(
+      (id) => !!id && models.some((m) => m.id === id),
+    ) ?? '';
+  const keepCustom =
+    provider === 'cloudflare' &&
+    profile?.custom === true &&
+    savedModel.length > 0 &&
+    !models.some((m) => m.id === savedModel);
+  const custom = provider === 'cloudflare' && (keepCustom || models.length === 0);
+  return { custom, model: keepCustom ? savedModel : custom ? '' : listed };
+}
 type Settings = { active: Provider; profiles: Partial<Record<Provider, Profile>> };
 const initial: Settings = { active: 'ollama', profiles: {} };
 const storageKey = 'ai.providers';
+/** A saved cloud connection that can turn speech into text (Whisper on OpenRouter or Cloudflare), the active one first. */
+export function transcriptionConnection(): { connection: Connection; label: string } | null {
+  const settings = readSaved<Settings>(storageKey, initial);
+  for (const provider of [settings.active, 'cloudflare', 'openrouter'] as Provider[]) {
+    if (provider !== 'cloudflare' && provider !== 'openrouter') continue;
+    const profile = settings.profiles?.[provider];
+    if (profile?.connection)
+      return { connection: profile.connection, label: providers[provider].label };
+  }
+  return null;
+}
+
 const defaults = (provider: Provider): Connection =>
   provider === 'cloudflare'
     ? { provider, gateway: 'default', accountId: '' }
@@ -88,22 +120,43 @@ export function ProviderPanel({
         models: Model[];
         preferredModel: string | null;
       }>('connect_ai', { connection: form, apiKey: key.trim() || null });
-      const custom = provider === 'cloudflare' && (profile?.custom === true || !models.length);
-      const model = custom
-        ? profile?.custom
-          ? profile.model
-          : ''
-        : ([profile?.model, preferredModel, models[0]?.id].find((id) =>
-            models.some((m) => m.id === id),
-          ) ?? '');
+      const { custom, model } = chosenModel(provider, profile, models, preferredModel);
       changeProfile({ connection: form, models, model, custom });
       setKey('');
       setExpanded(false);
+      if (!model) {
+        setProblem(
+          provider === 'cloudflare'
+            ? 'Enter a gateway model ID to analyze this source.'
+            : 'Choose a vision model to analyze this source.',
+        );
+        return null;
+      }
+      return { connection: form, model };
     } catch (e) {
       setProblem(errorText(e));
+      return null;
     } finally {
       setWorking(false);
     }
+  }
+  async function analyzeSource() {
+    if (!profile) return;
+    setProblem('');
+    let connection = profile.connection;
+    let model = profile.model;
+    if (!model) {
+      if (provider === 'cloudflare' && profile.models.length === 0) {
+        const loaded = await connect();
+        if (!loaded) return;
+        connection = loaded.connection;
+        model = loaded.model;
+      } else {
+        setProblem('Choose a vision model to analyze this source.');
+        return;
+      }
+    }
+    await analyze(connection, model);
   }
   async function forget() {
     if (!profile) return;
@@ -310,10 +363,18 @@ export function ProviderPanel({
                 ? `Analysis sends a nine-frame contact sheet and timestamps to ${meta.label}. Your original video stays on this device.`
                 : `Analysis sends sampled frames to your ${meta.label} server on port ${profile.connection.port}.`}
             </p>
+            {!profile.model && (
+              <p className="subnote">
+                {provider === 'cloudflare' && !profile.models.length
+                  ? 'No vision model is selected. Analyze source will load one from this account.'
+                  : 'Choose a vision model to analyze this source.'}
+              </p>
+            )}
             <button
+              type="button"
               className="btn primary wide"
-              disabled={disabled || !profile.model}
-              onClick={() => void analyze(profile.connection, profile.model)}
+              disabled={disabled}
+              onClick={() => void analyzeSource()}
             >
               <Sparkles size={15} />
               Analyze source
