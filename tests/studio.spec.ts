@@ -2,6 +2,7 @@ import { Buffer } from 'node:buffer';
 import { deflateSync } from 'node:zlib';
 import { stat } from 'node:fs/promises';
 import { expect, test } from '@playwright/test';
+import { openClipTools } from './clip-tools';
 import { logoFit, pngSize } from '../src/logo';
 import { musicAt } from '../src/music';
 import {
@@ -22,6 +23,7 @@ import {
   cutCaptions,
   editCue,
   paceCues,
+  presentCues,
   languageTag,
   readingLines,
   toSrt,
@@ -295,6 +297,7 @@ test('edit and persist a cut, then render the selected range', async ({ page }) 
   await page.goto('/');
   await expect(page.getByRole('heading', { name: 'Alpine field notes' })).toBeVisible();
   await page.locator('.cut-card').nth(2).click();
+  await openClipTools(page, 'Audio');
   await page.getByRole('button', { name: 'Cut out pauses', exact: true }).click();
   await expect(page.locator('.pause-note')).toHaveText(
     /1 pause marked, about \d+(\.\d)? s shorter/,
@@ -309,12 +312,19 @@ test('edit and persist a cut, then render the selected range', async ({ page }) 
   await page.getByLabel('Out point', { exact: true }).press('Enter');
   await page.getByRole('button', { name: '9:16', exact: true }).click();
   await page.getByRole('button', { name: 'Show the whole video', exact: true }).click();
+  await openClipTools(page, 'Headline and logo');
   await page.getByLabel('Headline', { exact: true }).fill('Valley light');
   await page.getByLabel('Headline', { exact: true }).press('Enter');
   await page.getByRole('button', { name: 'Clearer voice', exact: true }).click();
-  await page
-    .getByRole('checkbox', { name: 'I own this music or have permission to use it.' })
-    .click();
+  const musicRights = page.getByRole('checkbox', {
+    name: 'I own this audio or have permission to use it.',
+  });
+  await expect(page.getByRole('button', { name: 'Add music', exact: true })).toBeDisabled();
+  await musicRights.click();
+  await expect(musicRights).toBeChecked();
+  await musicRights.uncheck();
+  await expect(page.getByRole('button', { name: 'Add music', exact: true })).toBeDisabled();
+  await musicRights.check();
   await expect(page.getByRole('button', { name: 'Add music', exact: true })).toBeEnabled();
   await page.getByLabel('Music file').setInputFiles({
     name: 'bed.wav',
@@ -329,7 +339,7 @@ test('edit and persist a cut, then render the selected range', async ({ page }) 
     input.dispatchEvent(new Event('input', { bubbles: true }));
   });
   await expect(page.getByLabel('Music volume')).toHaveValue('40');
-  await expect(page.getByRole('button', { name: 'Show my logo', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Add logo', exact: true })).toBeVisible();
   await page.getByLabel('Logo file').setInputFiles({
     name: 'mark.png',
     mimeType: 'image/png',
@@ -388,6 +398,8 @@ test('edit and persist a cut, then render the selected range', async ({ page }) 
     page.getByRole('button', { name: 'Show the whole video', exact: true }),
   ).toHaveAttribute('aria-pressed', 'true');
   await expect(page.locator('.stage.blur-fill')).toBeVisible();
+  await openClipTools(page, 'Headline and logo');
+  await openClipTools(page, 'Audio');
   await expect(page.getByLabel('Headline', { exact: true })).toHaveValue('Valley light');
   await expect(page.locator('.headline')).toContainText('Valley light');
   await expect(page.getByRole('button', { name: 'Clearer voice', exact: true })).toHaveAttribute(
@@ -416,7 +428,7 @@ test('edit and persist a cut, then render the selected range', async ({ page }) 
     .poll(() => page.locator('video').evaluate((v) => (v as HTMLVideoElement).playbackRate))
     .toBe(1.5);
   await expect(
-    page.getByRole('checkbox', { name: 'I own this music or have permission to use it.' }),
+    page.getByRole('checkbox', { name: 'I own this audio or have permission to use it.' }),
   ).toHaveCount(0);
   await expect
     .poll(() => page.locator('video').evaluate((v) => (v as HTMLVideoElement).currentTime))
@@ -543,14 +555,41 @@ test('captions are cut, paced and edited as clip-ai does', () => {
   expect(paced[0].start).toBeCloseTo(0.92, 3);
   expect(paced[0].end).toBe(paced[1].start);
   expect(captionMoment(paced[0], 1.25).active).toBe(1);
-  // Every clip starts in Bold at the bottom, white with a lime highlight.
+  // Every clip starts in Bold at the bottom, white with Quikclip's ember highlight.
   const look = cutCaptions({});
   expect(look).toEqual({
     style: 'bold',
     position: 'bottom',
     color: '#FFFFFF',
-    highlight: '#D1F780',
+    highlight: '#FF8057',
   });
+  // A translation stays with the source time it was spoken, under the line or in its place.
+  const hello = [
+    {
+      start: 1,
+      end: 2,
+      text: 'Hello there',
+      words: [
+        { start: 1, end: 1.4, text: 'Hello' },
+        { start: 1.4, end: 2, text: 'there' },
+      ],
+    },
+  ];
+  const both = presentCues(
+    hello,
+    { language: 'es', both: true, lines: [{ at: 11, line: 'Hola' }] },
+    10,
+  );
+  expect(both[0]).toMatchObject({ text: 'Hello there', translation: 'Hola' });
+  const replaced = presentCues(
+    hello,
+    { language: 'es', both: false, lines: [{ at: 11, line: 'Hola allí' }] },
+    10,
+  );
+  expect(replaced[0].text).toBe('Hola allí');
+  expect(replaced[0].translation).toBeUndefined();
+  expect(toSrt(paceCues(both)).split('\n')[2]).toBe('Hello there');
+  expect(toSrt(paceCues(both))).toContain('Hola');
   // A line changed by hand gives the clip its own lines; the rest still come from the transcript.
   const edited = editCue(look, words, cues[1], 'Once more', 9, 14);
   expect(edited.from).toBe(9);
@@ -621,6 +660,7 @@ test('captions show over the preview and are styled and edited in the inspector'
     localStorage.setItem('quikclip.1.projects', JSON.stringify(projects));
   });
   await page.reload();
+  await openClipTools(page, 'Captions');
   const lines = page.getByRole('list', { name: 'Caption lines' });
   await expect(lines.getByRole('listitem')).toHaveCount(2);
   await expect(page.getByLabel('caption 1', { exact: false }).first()).toHaveValue(
@@ -636,23 +676,31 @@ test('captions show over the preview and are styled and edited in the inspector'
     .getByRole('button', { name: 'Pop' })
     .click();
   await expect(stage.locator('.caption-pop [data-active]')).toHaveText('on');
-  await page
+  const top = page
     .getByRole('group', { name: 'Caption position' })
-    .getByRole('button', { name: 'Top' })
-    .click();
+    .getByRole('button', { name: 'Top' });
+  await top.click();
+  await expect(top).toHaveAttribute('aria-pressed', 'true');
   const [box, frame] = await Promise.all([
     stage.locator('.caption-pop').boundingBox(),
     page.locator('.stage').boundingBox(),
   ]);
   expect(box!.y - frame!.y).toBeLessThan(frame!.height / 2);
-  await page
-    .getByRole('radiogroup', { name: 'Caption highlight' })
-    .getByRole('radio', { name: 'Yellow' })
-    .click();
+  const highlights = page.getByRole('radiogroup', { name: 'Caption highlight color' });
+  const sun = highlights.getByRole('radio', { name: 'Sun' });
+  await sun.click();
+  await expect(sun).toHaveAttribute('aria-checked', 'true');
   await expect(stage.locator('.caption-pop [data-active]')).toHaveCSS(
     'background-color',
-    'rgb(255, 229, 0)',
+    'rgb(255, 209, 102)',
   );
+  await sun.press('ArrowLeft');
+  const ember = highlights.getByRole('radio', { name: 'Ember' });
+  await expect(ember).toBeFocused();
+  await expect(ember).toHaveAttribute('aria-checked', 'true');
+  await expect(page.locator('.time-now')).toHaveText('00:01.30');
+  await expect(page.getByLabel('Translate into')).toBeVisible();
+  await expect(page.getByRole('switch', { name: 'Show both languages' })).toBeVisible();
   // A fixed word keeps the line's time.
   const first = lines.locator('textarea').first();
   await first.fill('Snow on the peaks.');
@@ -744,6 +792,7 @@ test('every desktop video is transcribed and its clips get captions and a transc
   });
   await page.goto('/');
   // Made automatically on opening, with the saved Cloudflare connection; the clip has captions from it.
+  await openClipTools(page, 'Captions');
   const lines = page.getByRole('list', { name: 'Caption lines' });
   await expect(lines.getByRole('listitem')).toHaveCount(2);
   const asked = await page.evaluate(() =>
@@ -758,6 +807,7 @@ test('every desktop video is transcribed and its clips get captions and a transc
   await expect(page.locator('.caption-stage')).toHaveAttribute('lang', 'en');
   // The transcript: read it, go to a word, correct a misheard one for every clip, set the clip from a stretch of words.
   await page.getByRole('tab', { name: 'Transcript' }).click();
+  await expect(page.getByLabel('Spoken language')).toHaveValue('auto');
   const transcript = page.getByRole('list', { name: 'Transcript' });
   await expect(transcript.getByRole('listitem')).toHaveCount(2);
   await transcript.getByRole('button', { name: 'Clouds' }).click();
@@ -795,6 +845,7 @@ test('every desktop video is transcribed and its clips get captions and a transc
   await page.getByRole('tab', { name: 'Clips' }).click();
   // The correction is kept with the project.
   await page.reload();
+  await openClipTools(page, 'Captions');
   await expect(
     page.getByRole('list', { name: 'Caption lines' }).locator('textarea').first(),
   ).toHaveValue('on summits.');

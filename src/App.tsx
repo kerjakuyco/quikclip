@@ -2,6 +2,7 @@ import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
   ProviderPanel,
+  suggestionModel,
   transcriptionConnection,
   type Connection,
 } from './components/ProviderPanel';
@@ -13,8 +14,11 @@ import {
   captionWords,
   correctedWords,
   cutCaptions,
+  TRANSLATE_LANGUAGES,
+  languageName,
   languageTag,
   paceCues,
+  presentCues,
   readingLines,
   toSrt,
   transcriptText,
@@ -24,25 +28,16 @@ import { TranscriptPanel, type TranscriptStatus } from './components/TranscriptP
 import { listen } from '@tauri-apps/api/event';
 import {
   ArrowDownToLine,
-  ArrowRight,
-  BadgeCheck,
   BookOpen,
   Check,
-  ChevronRight,
   CircleAlert,
-  CircleHelp,
-  Clapperboard,
   Clock3,
   Download,
   Film,
   FolderOpen,
-  HardDrive,
-  Keyboard,
-  Layers3,
   Link2,
   LoaderCircle,
   Maximize,
-  PanelTop,
   Pause,
   Play,
   Plus,
@@ -99,15 +94,11 @@ import { Inspector } from './components/Inspector';
 import { JobProgress, useElapsed, type JobStep } from './components/JobProgress';
 import { Timeline } from './components/Timeline';
 import { Dialog } from './components/Dialog';
+import { StudioShell, type Page } from './components/StudioShell';
+import { ExportHistory, MediaLibrary } from './components/WorkspacePages';
 import './studio.css';
 
-type Page = 'Clip editor' | 'Media library' | 'Exports';
 type Modal = 'import' | 'export' | 'ai' | 'keys' | 'guide' | 'delete' | null;
-const nav = [
-  ['Clip editor', Clapperboard],
-  ['Media library', Layers3],
-  ['Exports', ArrowDownToLine],
-] as const;
 const shortcuts = [
   ['Space', 'Play / pause'],
   ['←  →', 'Step one frame'],
@@ -153,6 +144,8 @@ export default function App() {
     [transcribing, setTranscribing] = useState<Record<string, TranscriptStatus>>({});
   const asked = useRef(new Set<string>());
   const [panel, setPanel] = useState<'clips' | 'transcript'>('clips');
+  const [spokenLanguage, setSpokenLanguage] = useState<Record<string, string>>({});
+  const [translating, setTranslating] = useState(false);
   const [step, setStep] = useState<JobStep | null>(null),
     [busySince, setBusySince] = useState(0);
   const busyFor = useElapsed(busySince);
@@ -397,17 +390,20 @@ export default function App() {
     edit((s) => ({ ...s, cuts: s.cuts.map((c) => (c.id === cut.id ? { ...c, ...delta } : c)) }));
   }
   /** The whole video's transcript (src-tauri transcript.rs): made once, in the background, with progress as it goes. */
-  async function transcribe(id: string) {
+  async function transcribe(id: string, again = false) {
     const linked = transcriptionConnection();
     if (!linked) {
       setTranscribing((prev) => ({ ...prev, [id]: { state: 'connect' } }));
       return;
     }
+    const chosen = spokenLanguage[id];
     setTranscribing((prev) => ({ ...prev, [id]: { state: 'working', done: 0, total: 0 } }));
     try {
       const made = await invoke<Transcript>('transcribe_source', {
         id,
         connection: linked.connection,
+        language: chosen && chosen !== 'auto' ? chosen : null,
+        again,
       });
       setTranscripts((prev) => ({ ...prev, [id]: made }));
       setTranscribing(({ [id]: _, ...rest }) => rest);
@@ -541,6 +537,15 @@ export default function App() {
       v.play().catch(() => setToast('Playback unavailable. Check the source or import an MP4.'));
     }
   }
+  async function toggleFullscreen() {
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else if (monitor.current?.requestFullscreen) await monitor.current.requestFullscreen();
+      else setToast('Fullscreen is unavailable.');
+    } catch {
+      setToast('Fullscreen is unavailable.');
+    }
+  }
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
       if (
@@ -557,7 +562,7 @@ export default function App() {
         return;
       }
       if (page !== 'Clip editor') return;
-      if (e.code === 'Space' && !(e.target as HTMLElement)?.closest('button')) {
+      if (e.code === 'Space' && !(e.target as HTMLElement)?.closest('button, summary, a[href]')) {
         e.preventDefault();
         play();
       }
@@ -722,10 +727,51 @@ export default function App() {
   const captions = cutCaptions(cut);
   // `captions` is rebuilt from cut.captions on every render, so the memos follow the stored value.
   const captionSource = useMemo(() => captionWords(heard, captions), [heard, cut.captions]);
-  const cues = useMemo(
+  const sourceCues = useMemo(
     () => buildCues(captionSource, cut.start, cut.end),
     [captionSource, cut.start, cut.end],
   );
+  const cues = useMemo(
+    () => presentCues(sourceCues, captions.translation, cut.start),
+    [sourceCues, captions.translation, cut.start],
+  );
+  async function translateClip(language: string, both: boolean) {
+    const linked = suggestionModel();
+    if (!linked) {
+      setToast('Choose a model in Highlight finder before translating captions.');
+      open('ai');
+      return;
+    }
+    const known = TRANSLATE_LANGUAGES.find((item) => item.code === language)?.code;
+    if (!sourceCues.length || !known) return;
+    setTranslating(true);
+    try {
+      const lines = await invoke<string[]>('translate_captions', {
+        connection: linked.connection,
+        model: linked.model,
+        language: known,
+        lines: sourceCues.map((cue) => cue.text),
+      });
+      update({
+        captions: {
+          ...captions,
+          translation: {
+            language: known,
+            both,
+            lines: sourceCues.flatMap((cue, index) => {
+              const line = (lines[index] ?? '').replace(/\s+/g, ' ').trim();
+              return line ? [{ at: Math.round((cut.start + cue.start) * 1000) / 1000, line }] : [];
+            }),
+          },
+        },
+      });
+      setToast(`Captions translated to ${languageName(known)}.`);
+    } catch (e) {
+      setToast(errorText(e));
+    } finally {
+      setTranslating(false);
+    }
+  }
   const status: TranscriptStatus | null = !desktop
     ? { state: 'unavailable', text: 'Transcripts are made in the Quikclip desktop app.' }
     : p.id === 'sample'
@@ -738,12 +784,12 @@ export default function App() {
     ? null
     : status?.state === 'working'
       ? status.total
-        ? `Transcribing the video: ${status.done} of ${status.total} parts. Every clip's captions appear when it's done.`
-        : "Transcribing the video. Every clip's captions appear when it's done."
+        ? `Transcribing the source (${status.done} of ${status.total} parts). Captions will appear here when it’s ready.`
+        : 'Transcribing the source. Captions will appear here when it’s ready.'
       : status?.state === 'error'
         ? `The transcript stopped: ${status.text}`
         : status?.state === 'connect'
-          ? 'Connect OpenRouter or Cloudflare in Highlight finder to transcribe this video.'
+          ? 'Connect OpenRouter or Cloudflare in Highlight finder to create captions.'
           : status?.state === 'unavailable'
             ? status.text
             : 'Reading the transcript…';
@@ -764,511 +810,338 @@ export default function App() {
         )
       : 0;
   const lines = headlineLines(headline, head.columns);
-  const projectIndex = String(projects.indexOf(p) + 1).padStart(3, '0');
+  const projectIndex = String(projects.indexOf(p) + 1).padStart(2, '0');
   const poster = asset(p, p.poster) ?? frame(p, 0);
+  const outputShape = { source: 'Original', vertical: '9:16', square: '1:1' }[cut.shape];
   return (
-    <div className="shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <img src="/mark.svg" alt="" />
-          <strong>Quikclip</strong>
-          <span>STUDIO</span>
-        </div>
-        <div className="side-content">
-          <div className="side-label">Workspace</div>
-          <nav>
-            {nav.map(([name, Icon]) => (
-              <button
-                aria-label={name}
-                title={name}
-                className={`nav-item ${page === name ? 'current' : ''}`}
-                key={name}
-                onClick={() => navigate(name)}
-                aria-current={page === name ? 'page' : undefined}
-              >
-                <Icon size={17} />
-                <span>{name}</span>
-                {name === 'Clip editor' && page === name && <i />}
-              </button>
-            ))}
-          </nav>
-          <div className="side-rule" />
-          <div className="side-label side-split">
-            Projects
-            <button
-              className="icon-btn"
-              aria-label="Import new project"
-              onClick={() => open('import')}
-            >
-              <Plus size={14} />
-            </button>
-          </div>
-          <div className="project-nav">
-            {projects.map((q) => (
-              <div className="project-row" key={q.id}>
-                <button
-                  onClick={() => choose(q)}
-                  className={`project-item ${q.id === p.id ? 'chosen' : ''}`}
-                >
-                  <i />
-                  <span>{q.title}</span>
-                </button>
-                {projects.length > 1 && (
-                  <button
-                    className="icon-btn project-delete"
-                    aria-label={`Delete ${q.title}`}
-                    title="Delete project"
-                    disabled={!!busy}
-                    onClick={() => askDelete(q)}
-                  >
-                    <Trash2 />
-                  </button>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-        <div className="side-bottom">
-          <button onClick={() => open('keys')}>
-            <Keyboard size={16} />
-            <span>Keyboard shortcuts</span>
-          </button>
-          <button onClick={() => open('guide')}>
-            <CircleHelp size={16} />
-            <span>Studio guide</span>
-          </button>
-          <div className="device">
-            <span className="device-icon">
-              <HardDrive size={18} />
-            </span>
-            <div>
-              <strong>Local workspace</strong>
-              <small>
-                <i /> On this device
-              </small>
-            </div>
-          </div>
-        </div>
-      </aside>
-      <main>
-        <header className="topbar">
-          <div className="breadcrumbs">
-            <PanelTop size={16} />
-            <span>Workspace</span>
-            <ChevronRight size={13} />
-            <b>{page}</b>
-          </div>
-          <div className="top-actions">
-            <button className="btn secondary" onClick={() => open('import')}>
-              <Plus size={16} />
-              Import media
-            </button>
-            {page === 'Clip editor' && (
-              <button className="btn primary" onClick={() => open('export')}>
-                <ArrowDownToLine size={15} />
-                Export clip
-              </button>
-            )}
-          </div>
-        </header>
-        <div className="content">
-          <div className="page-title">
-            <div>
-              <div className="eyebrow kicker">
-                <i />
-                {page === 'Clip editor'
-                  ? `EDITING STUDIO  /  PROJECT ${projectIndex}`
-                  : 'YOUR WORKSPACE'}
-              </div>
-              <h1>{page === 'Clip editor' ? p.title : page}</h1>
-              {page === 'Clip editor' ? (
-                <div className="metadata">
-                  <span className="source-badge">
-                    <Film size={12} />
-                    {p.source === 'Sample' ? 'Sample project' : p.source}
-                  </span>
-                  <i />
-                  <span>
-                    <Clock3 />
-                    {clock(p.duration)}
-                  </span>
-                  <i />
-                  <span>
-                    {p.width} × {p.height}
-                  </span>
-                  {p.fps > 0 && (
-                    <>
-                      <i />
-                      <span>{Math.round(p.fps * 100) / 100} fps</span>
-                    </>
-                  )}
-                </div>
-              ) : (
-                <p>
-                  {page === 'Media library'
-                    ? 'Your source videos, ready for the next cut.'
-                    : 'A history of the clips you’ve rendered.'}
-                </p>
-              )}
-            </div>
-            {page === 'Clip editor' && (
-              <span className={`save-status ${saved ? '' : 'unsaved'}`}>
-                <i />
-                {saved ? 'Changes saved' : 'Storage full · unsaved'}
-              </span>
-            )}
-          </div>
-          {page === 'Clip editor' ? (
-            <div className="edit-grid">
-              <div className="work-column">
-                <section className="panel monitor" ref={monitor}>
-                  <div className="panel-heading">
-                    <h2>
-                      <ScanLine />
-                      Source monitor
-                    </h2>
-                    <span className="tiny-tag">
-                      <i />
-                      PREVIEW
+    <>
+      <StudioShell
+        page={page}
+        project={p}
+        projects={projects}
+        saved={saved}
+        busy={!!busy}
+        onNavigate={navigate}
+        onChoose={choose}
+        onDelete={askDelete}
+        onImport={() => open('import')}
+        onExport={() => open('export')}
+        onShortcuts={() => open('keys')}
+        onGuide={() => open('guide')}
+        notice={setToast}
+      >
+        {page === 'Clip editor' ? (
+          <div className="edit-grid">
+            <div className="editor-stage">
+              <header className="project-header">
+                <div className="project-heading">
+                  <div className="project-context">
+                    <span>Project {projectIndex}</span>
+                    <span className="source-badge">
+                      <Film size={12} />
+                      {p.source === 'Sample' ? 'Sample project' : p.source}
                     </span>
                   </div>
-                  <div
-                    className="screen"
-                    onDoubleClick={() => {
-                      if (document.fullscreenElement) document.exitFullscreen();
-                      else
-                        monitor.current
-                          ?.requestFullscreen()
-                          .catch(() => setToast('Fullscreen is unavailable.'));
-                    }}
-                  >
-                    {src && (
-                      <div
-                        className={`stage${blur ? ' blur-fill' : ''}`}
-                        style={{
-                          width: `min(100cqw, ${ratio * 100}cqh)`,
-                          height: `min(100cqh, ${100 / ratio}cqw)`,
-                        }}
-                      >
-                        {blur && (
-                          <img className="blur-plate" alt="" src={frame(p, time) ?? poster} />
-                        )}
-                        <video
-                          key={src}
-                          ref={video}
-                          src={src}
-                          poster={poster}
-                          playsInline
-                          preload="metadata"
-                          muted={muted}
-                          onClick={play}
-                          onLoadedMetadata={(e) => {
-                            e.currentTarget.playbackRate = speed * cutSpeed(cut);
-                            e.currentTarget.currentTime = cut.start;
-                            setTime(cut.start);
-                          }}
-                          onTimeUpdate={(e) => {
-                            const v = e.currentTarget;
-                            if (!v.paused) {
-                              const hit = skips.current.find(
-                                (item) =>
-                                  v.currentTime >= item.start && v.currentTime < item.end - 0.02,
-                              );
-                              if (hit) v.currentTime = Math.min(hit.end, cut.end);
-                              if (loop && v.currentTime >= cut.end) v.currentTime = cut.start;
-                            }
-                            setTime(v.currentTime);
-                            syncMusic.current(v, !v.paused);
-                          }}
-                          onPlay={(e) => {
-                            setPlaying(true);
-                            syncMusic.current(e.currentTarget, true);
-                          }}
-                          onPause={(e) => {
-                            setPlaying(false);
-                            syncMusic.current(e.currentTarget, false);
-                          }}
-                          onEnded={() => {
-                            if (loop) {
-                              seek(cut.start);
-                              video.current?.play().catch(() => setPlaying(false));
-                            } else setPlaying(false);
-                          }}
-                          onError={() =>
-                            setSourceError(
-                              'The source cannot be played. Re-import a supported video.',
-                            )
-                          }
-                        />
-                        {lines.length > 0 && (
-                          <p
-                            className="headline"
-                            style={{
-                              top: `${head.top * 100}%`,
-                              fontSize: `calc(${head.size} / 1080 * 100cqmin)`,
-                            }}
-                          >
-                            <span>
-                              {lines.map((line, i) => (
-                                <Fragment key={i}>
-                                  {i > 0 && <br />}
-                                  {line}
-                                </Fragment>
-                              ))}
-                            </span>
-                          </p>
-                        )}
-                        {cues.length > 0 && (
-                          <LiveCaptions
-                            cues={cues}
-                            time={time - cut.start}
-                            captions={captions}
-                            width={pixels.width}
-                            height={pixels.height}
-                            top={captionStart}
-                            duration={cut.end - cut.start}
-                            lang={languageTag(transcript?.language)}
-                          />
-                        )}
-                        {logoUrl && logo && logoBox && (
-                          <img
-                            className="logo"
-                            alt=""
-                            aria-hidden="true"
-                            draggable={false}
-                            src={logoUrl}
-                            data-logo-corner={logo.corner}
-                            style={{
-                              left: `${logoBox.left * 100}%`,
-                              top: `${logoBox.top * 100}%`,
-                              width: `${logoBox.width * 100}%`,
-                              height: `${logoBox.height * 100}%`,
-                            }}
-                          />
-                        )}
-                        {musicUrl && (
-                          <audio
-                            key={musicUrl}
-                            ref={musicEl}
-                            className="music-bed"
-                            src={musicUrl}
-                            preload="auto"
-                            hidden
-                          />
-                        )}
-                      </div>
-                    )}
-                    {sourceError && (
-                      <div className="media-error">
-                        <CircleAlert />
-                        {sourceError}
-                      </div>
-                    )}
-                  </div>
-                  <div className="transport">
-                    <div className="transport-left">
-                      <button
-                        className="play-btn"
-                        aria-label={playing ? 'Pause' : 'Play'}
-                        onClick={play}
-                      >
-                        {playing ? <Pause /> : <Play />}
-                      </button>
-                      <span className="time-now">{clock(time, true)}</span>
-                      <span className="time-total">/ {clock(p.duration)}</span>
-                    </div>
-                    <div className="transport-right">
-                      <button
-                        className="icon-btn optional"
-                        title="Jump to clip start"
-                        aria-label="Jump to clip start"
-                        onClick={() => seek(cut.start)}
-                      >
-                        <SkipBack />
-                      </button>
-                      <button
-                        className="icon-btn optional"
-                        title="Jump to clip end"
-                        aria-label="Jump to clip end"
-                        onClick={() => seek(cut.end)}
-                      >
-                        <SkipForward />
-                      </button>
-                      <i className="vline optional" />
-                      <button
-                        className={`icon-btn ${loop ? 'accent' : ''}`}
-                        aria-label="Loop selected clip"
-                        aria-pressed={loop}
-                        title="Loop selected clip"
-                        onClick={() => setLoop(!loop)}
-                      >
-                        <Repeat2 />
-                      </button>
-                      <button
-                        className="speed-btn"
-                        title="Change playback speed"
-                        onClick={() => {
-                          const speeds = [0.5, 1, 1.5, 2];
-                          const s = speeds[(speeds.indexOf(speed) + 1) % 4];
-                          setSpeed(s);
-                          if (video.current) video.current.playbackRate = s * cutSpeed(cut);
-                        }}
-                      >
-                        {speed}×
-                      </button>
-                      <button
-                        className="icon-btn"
-                        aria-label={muted ? 'Unmute' : 'Mute'}
-                        onClick={() => setMuted(!muted)}
-                      >
-                        {muted ? <VolumeX /> : <Volume2 />}
-                      </button>
-                      <button
-                        className="icon-btn"
-                        aria-label="Fullscreen monitor"
-                        onClick={() => {
-                          if (document.fullscreenElement) document.exitFullscreen();
-                          else
-                            monitor.current
-                              ?.requestFullscreen()
-                              .catch(() => setToast('Fullscreen unavailable'));
-                        }}
-                      >
-                        <Maximize />
-                      </button>
-                    </div>
-                  </div>
-                </section>
-                <Timeline p={p} cut={cut} time={time} seek={seek} trim={trim} add={addCut} />
-                <div className="work-hint">
-                  <Keyboard size={14} />
-                  <kbd>Space</kbd> Play / pause <i /> <kbd>I</kbd>
-                  <kbd>O</kbd> Set in / out
+                  <h1 title={p.title}>{p.title}</h1>
                 </div>
-              </div>
-              <Inspector
-                p={p}
-                cut={cut}
-                select={select}
-                update={update}
-                trim={trim}
-                analyze={() => open('ai')}
-                remove={remove}
-                notice={setToast}
-                panel={panel}
-                setPanel={setPanel}
-                captions={
-                  <CaptionFields
-                    cut={cut}
-                    captions={captions}
-                    cues={cues}
-                    words={captionSource}
-                    update={update}
-                    waiting={waiting}
-                    openTranscript={() => setPanel('transcript')}
-                  />
-                }
-                transcript={
-                  <TranscriptPanel
-                    transcript={transcript}
-                    fixes={p.fixes}
-                    status={status}
-                    time={time}
-                    clip={cut}
-                    onSeek={seek}
-                    onRange={(start, end) => {
-                      const from = round(clamp(start, 0, p.duration - 0.25));
-                      update({ start: from, end: round(clamp(end, from + 0.25, p.duration)) });
-                      seek(from);
-                    }}
-                    onFix={fixWord}
-                    onRetry={() => void transcribe(p.id)}
-                    onConnect={() => open('ai')}
-                    onDownload={(kind) => void downloadTranscript(kind)}
-                  />
-                }
-                pauseNote={
-                  !cutPauses(cut)
-                    ? 'Drops quiet stretches of half a second or more.'
-                    : pauseError
-                      ? pauseError
-                      : pausePlan
-                        ? pauseSummary(pausePlan)
-                        : 'Listening for quiet…'
-                }
-              />
-            </div>
-          ) : page === 'Media library' ? (
-            <div className="library-grid">
-              {projects.map((q) => (
-                <div className="library-item" key={q.id}>
-                  <button className="library-card" onClick={() => choose(q)}>
-                    <img alt="" src={asset(q, q.poster) ?? frame(q, 0)} />
-                    <div>
-                      <small>
-                        {q.source} · {clock(q.duration)}
-                      </small>
-                      <h3>{q.title}</h3>
-                      <span>
-                        {q.cuts.length} clips <ArrowRight size={14} />
-                      </span>
-                    </div>
-                  </button>
-                  {projects.length > 1 && (
-                    <button
-                      className="icon-btn library-delete"
-                      aria-label={`Delete ${q.title}`}
-                      title="Delete project"
-                      disabled={!!busy}
-                      onClick={() => askDelete(q)}
-                    >
-                      <Trash2 />
-                    </button>
-                  )}
-                </div>
-              ))}
-              <button className="import-tile" onClick={() => open('import')}>
-                <Plus />
-                Import media
-              </button>
-            </div>
-          ) : entries.length ? (
-            <div className="exports-list">
-              {entries.map((e) => (
-                <div className="export-row" key={e.id}>
-                  <span className="export-icon">
-                    <BadgeCheck />
+                <div className="metadata" role="group" aria-label="Source details">
+                  <span title="Source duration">
+                    <Clock3 size={14} />
+                    {clock(p.duration)}
                   </span>
-                  <div>
-                    <strong>{e.title}</strong>
-                    <small>
-                      {e.project} · {clock(e.duration)} · {new Date(e.date).toLocaleDateString()}
-                    </small>
-                    <code>{e.path}</code>
+                  <span title="Source resolution">
+                    {p.width} × {p.height}
+                  </span>
+                  {p.fps > 0 && <span>{Math.round(p.fps * 100) / 100} fps</span>}
+                </div>
+              </header>
+              <section className="monitor" ref={monitor} aria-labelledby="monitor-title">
+                <div className="panel-heading">
+                  <h2 id="monitor-title">
+                    <ScanLine />
+                    Source monitor
+                  </h2>
+                  <span className="monitor-format" title="Preview output frame">
+                    <span>{outputShape}</span>
+                    {pixels.width} × {pixels.height}
+                  </span>
+                </div>
+                <div className="screen" onDoubleClick={toggleFullscreen}>
+                  {src && (
+                    <div
+                      className={`stage${blur ? ' blur-fill' : ''}`}
+                      style={{
+                        width: `min(100cqw, ${ratio * 100}cqh)`,
+                        height: `min(100cqh, ${100 / ratio}cqw)`,
+                      }}
+                    >
+                      {blur && <img className="blur-plate" alt="" src={frame(p, time) ?? poster} />}
+                      <video
+                        key={src}
+                        ref={video}
+                        src={src}
+                        aria-label={`Video preview: ${p.title}`}
+                        poster={poster}
+                        playsInline
+                        preload="metadata"
+                        muted={muted}
+                        onClick={play}
+                        onLoadedMetadata={(e) => {
+                          e.currentTarget.playbackRate = speed * cutSpeed(cut);
+                          e.currentTarget.currentTime = cut.start;
+                          setTime(cut.start);
+                        }}
+                        onTimeUpdate={(e) => {
+                          const v = e.currentTarget;
+                          if (!v.paused) {
+                            const hit = skips.current.find(
+                              (item) =>
+                                v.currentTime >= item.start && v.currentTime < item.end - 0.02,
+                            );
+                            if (hit) v.currentTime = Math.min(hit.end, cut.end);
+                            if (loop && v.currentTime >= cut.end) v.currentTime = cut.start;
+                          }
+                          setTime(v.currentTime);
+                          syncMusic.current(v, !v.paused);
+                        }}
+                        onPlay={(e) => {
+                          setPlaying(true);
+                          syncMusic.current(e.currentTarget, true);
+                        }}
+                        onPause={(e) => {
+                          setPlaying(false);
+                          syncMusic.current(e.currentTarget, false);
+                        }}
+                        onEnded={() => {
+                          if (loop) {
+                            seek(cut.start);
+                            video.current?.play().catch(() => setPlaying(false));
+                          } else setPlaying(false);
+                        }}
+                        onError={() =>
+                          setSourceError(
+                            'The source cannot be played. Re-import a supported video.',
+                          )
+                        }
+                      />
+                      {lines.length > 0 && (
+                        <p
+                          className="headline"
+                          style={{
+                            top: `${head.top * 100}%`,
+                            fontSize: `calc(${head.size} / 1080 * 100cqmin)`,
+                          }}
+                        >
+                          <span>
+                            {lines.map((line, i) => (
+                              <Fragment key={i}>
+                                {i > 0 && <br />}
+                                {line}
+                              </Fragment>
+                            ))}
+                          </span>
+                        </p>
+                      )}
+                      {cues.length > 0 && (
+                        <LiveCaptions
+                          cues={cues}
+                          time={time - cut.start}
+                          captions={captions}
+                          width={pixels.width}
+                          height={pixels.height}
+                          top={captionStart}
+                          duration={cut.end - cut.start}
+                          lang={languageTag(transcript?.language)}
+                        />
+                      )}
+                      {logoUrl && logo && logoBox && (
+                        <img
+                          className="logo"
+                          alt=""
+                          aria-hidden="true"
+                          draggable={false}
+                          src={logoUrl}
+                          data-logo-corner={logo.corner}
+                          style={{
+                            left: `${logoBox.left * 100}%`,
+                            top: `${logoBox.top * 100}%`,
+                            width: `${logoBox.width * 100}%`,
+                            height: `${logoBox.height * 100}%`,
+                          }}
+                        />
+                      )}
+                      {musicUrl && (
+                        <audio
+                          key={musicUrl}
+                          ref={musicEl}
+                          className="music-bed"
+                          src={musicUrl}
+                          preload="auto"
+                          hidden
+                        />
+                      )}
+                    </div>
+                  )}
+                  {sourceError ? (
+                    <div className="media-error" role="alert">
+                      <CircleAlert size={17} />
+                      {sourceError}
+                    </div>
+                  ) : !src ? (
+                    <span className="monitor-loading" role="status">
+                      Loading source…
+                    </span>
+                  ) : null}
+                </div>
+                <div className="transport">
+                  <div className="transport-time" role="group" aria-label="Source time">
+                    <span className="time-now">{clock(time, true)}</span>
+                    <span className="time-total">/ {clock(p.duration)}</span>
+                  </div>
+                  <div className="transport-playback" role="group" aria-label="Playback">
+                    <button
+                      className="icon-btn"
+                      title="Jump to clip start"
+                      aria-label="Jump to clip start"
+                      onClick={() => seek(cut.start)}
+                    >
+                      <SkipBack />
+                    </button>
+                    <button
+                      className="play-btn"
+                      data-playing={playing || undefined}
+                      aria-label={playing ? 'Pause' : 'Play'}
+                      title={playing ? 'Pause (Space)' : 'Play (Space)'}
+                      disabled={!src || !!sourceError}
+                      onClick={play}
+                    >
+                      {playing ? <Pause /> : <Play />}
+                    </button>
+                    <button
+                      className="icon-btn"
+                      title="Jump to clip end"
+                      aria-label="Jump to clip end"
+                      onClick={() => seek(cut.end)}
+                    >
+                      <SkipForward />
+                    </button>
+                  </div>
+                  <div className="transport-right" role="group" aria-label="Monitor controls">
+                    <button
+                      className={`icon-btn ${loop ? 'accent' : ''}`}
+                      aria-label="Loop selected clip"
+                      aria-pressed={loop}
+                      title="Loop selected clip"
+                      onClick={() => setLoop(!loop)}
+                    >
+                      <Repeat2 />
+                    </button>
+                    <button
+                      className="speed-btn"
+                      title="Change playback speed"
+                      aria-label={`Playback speed: ${speed} times`}
+                      onClick={() => {
+                        const speeds = [0.5, 1, 1.5, 2];
+                        const s = speeds[(speeds.indexOf(speed) + 1) % 4];
+                        setSpeed(s);
+                        if (video.current) video.current.playbackRate = s * cutSpeed(cut);
+                      }}
+                    >
+                      {speed}×
+                    </button>
+                    <button
+                      className="icon-btn"
+                      aria-label={muted ? 'Unmute' : 'Mute'}
+                      title={muted ? 'Unmute monitor (M)' : 'Mute monitor (M)'}
+                      onClick={() => setMuted(!muted)}
+                    >
+                      {muted ? <VolumeX /> : <Volume2 />}
+                    </button>
+                    <button
+                      className="icon-btn"
+                      aria-label="Fullscreen monitor"
+                      title="Toggle fullscreen"
+                      onClick={toggleFullscreen}
+                    >
+                      <Maximize />
+                    </button>
                   </div>
                 </div>
-              ))}
+              </section>
             </div>
-          ) : (
-            <div className="empty panel">
-              <Download />
-              <h2>No exports yet</h2>
-              <p>Select a clip in the editor and export your first cut.</p>
-              <button className="btn secondary" onClick={() => navigate('Clip editor')}>
-                Open clip editor <ArrowRight size={14} />
-              </button>
-            </div>
-          )}
-        </div>
-        <footer className="statusbar">
-          <span>
-            <i /> Studio ready
-          </span>
-          <span>
-            QUIKCLIP STUDIO <b>/</b> V0.1
-          </span>
-        </footer>
-      </main>
+            <Timeline p={p} cut={cut} time={time} seek={seek} trim={trim} add={addCut} />
+            <Inspector
+              p={p}
+              cut={cut}
+              select={select}
+              update={update}
+              trim={trim}
+              analyze={() => open('ai')}
+              remove={remove}
+              notice={setToast}
+              panel={panel}
+              setPanel={setPanel}
+              captions={
+                <CaptionFields
+                  cut={cut}
+                  captions={captions}
+                  cues={cues}
+                  words={captionSource}
+                  update={update}
+                  waiting={waiting}
+                  openTranscript={() => {
+                    setPanel('transcript');
+                    document.getElementById('inspector-tab-transcript')?.focus();
+                  }}
+                  spoken={transcript?.language}
+                  translating={translating}
+                  onTranslate={(language, both) => void translateClip(language, both)}
+                />
+              }
+              transcript={
+                <TranscriptPanel
+                  transcript={transcript}
+                  fixes={p.fixes}
+                  status={status}
+                  time={time}
+                  clip={cut}
+                  onSeek={seek}
+                  onRange={(start, end) => {
+                    const from = round(clamp(start, 0, p.duration - 0.25));
+                    update({ start: from, end: round(clamp(end, from + 0.25, p.duration)) });
+                    seek(from);
+                  }}
+                  onFix={fixWord}
+                  language={spokenLanguage[p.id] ?? 'auto'}
+                  onLanguage={(code) => setSpokenLanguage((prev) => ({ ...prev, [p.id]: code }))}
+                  onTranscribe={(again) => void transcribe(p.id, again)}
+                  onConnect={() => open('ai')}
+                  onDownload={(kind) => void downloadTranscript(kind)}
+                />
+              }
+              pauseNote={
+                !cutPauses(cut)
+                  ? 'Remove quiet stretches of 0.5 seconds or longer.'
+                  : pauseError
+                    ? pauseError
+                    : pausePlan
+                      ? pauseSummary(pausePlan)
+                      : 'Listening for quiet…'
+              }
+            />
+          </div>
+        ) : page === 'Media library' ? (
+          <MediaLibrary
+            projects={projects}
+            busy={!!busy}
+            onChoose={choose}
+            onDelete={askDelete}
+            onImport={() => open('import')}
+          />
+        ) : (
+          <ExportHistory entries={entries} onEdit={() => navigate('Clip editor')} />
+        )}
+      </StudioShell>
       {toast && (
         <div className="toast" role="status">
           <Check size={16} />
@@ -1280,7 +1153,7 @@ export default function App() {
       )}
       {modal && (
         <Dialog
-          eyebrow={modal === 'ai' ? 'AI CONNECTIONS' : 'QUIKCLIP STUDIO'}
+          eyebrow={modal === 'ai' ? 'AI connections' : 'Quikclip Studio'}
           title={
             {
               import: 'Import media',
@@ -1297,7 +1170,7 @@ export default function App() {
           {modal === 'import' && (
             <>
               <p>Start a project from a video file or a YouTube, Twitch, or Kick link.</p>
-              <div className="tabs">
+              <div className="tabs" role="group" aria-label="Import source">
                 {(
                   [
                     ['file', 'Local video', Upload],
@@ -1307,6 +1180,7 @@ export default function App() {
                   <button
                     disabled={!!busy}
                     className={t === tab ? 'active' : ''}
+                    aria-pressed={t === tab}
                     onClick={() => {
                       setTab(t);
                       setError('');
@@ -1535,7 +1409,7 @@ export default function App() {
                 [
                   Scissors,
                   'Shape the cut',
-                  "Select a clip, drag the timeline handles, or type precise in and out points. Choose Original, 9:16, or 1:1. On a cropped frame, Fill crops the picture and Whole keeps all of it on a blurred fill. A headline sits at the top. Speed plays the clip a little faster and keeps the voice's pitch. Show my logo puts a PNG in a corner. Every video is transcribed when it opens, and every clip gets captions from the transcript in Bold, Clean, Karaoke, or Pop; fix a misheard word in the Transcript tab. Clearer voice is applied on export, music plays under the clip, and Cut out pauses skips the quiet parts.",
+                  'Select a clip, then drag the timeline handles or enter exact in and out points. Choose a frame and clip speed. Open Captions to style or translate them, Headline and logo to add an overlay, or Audio to clean up voice, remove pauses, and add background music. Correct words for all clips in the Transcript tab.',
                 ],
                 [
                   Sparkles,
@@ -1599,6 +1473,6 @@ export default function App() {
           )}
         </Dialog>
       )}
-    </div>
+    </>
   );
 }

@@ -8,7 +8,7 @@
 
 Quikclip is an open-source desktop app built with Tauri 2, Rust, React, and TypeScript for Windows, macOS, and Linux. The bundled *Alpine field notes* project lets you try the editor immediately.
 
-![Quikclip Studio showing the source monitor, clip bin, trim timeline, and output framing controls](docs/studio.jpg)
+![Quikclip Studio showing the source monitor, clip inspector, and full-width trim timeline](docs/studio.jpg)
 
 ## Run the desktop app
 
@@ -34,7 +34,7 @@ The first desktop build downloads and verifies pinned tools for the target. Late
   - Anything else (10-bit or HDR, larger than 1080p, rotated, or a codec the player cannot play) is re-encoded to H.264, with a hardware encoder when one is available (NVENC, AMF, Quick Sync, or VideoToolbox).
 
   Exports always re-encode just the clip, so a kept AV1 or HEVC original costs a little extra time per exported minute instead of a full re-encode at import.
-- **Clip bin** holds independent, named cuts from one source. Select a cut, drag the range handles, or enter exact in/out times. Click the filmstrip to scrub; **Add clip** starts a cut at the playhead.
+- **Source clips** holds independent, named cuts from one source. Select a cut, drag the range handles, or enter exact in/out times. Click the filmstrip to scrub; **Add clip** starts a cut at the playhead. In the Clips tab, expand Captions, Headline and logo, or Audio for the selected cut.
 - **Output frame** previews the same centered crop used by the renderer: original, portrait 9:16, or square 1:1. Enable the loop control to review just the selection.
 - **Transcript.** Every imported video is transcribed automatically once it opens, in the background: its audio goes to Whisper large v3 turbo on your connected OpenRouter or Cloudflare account in 10-minute parts, three at a time, retried on network and rate-limit errors. Each part is kept as it arrives, so an interrupted run resumes where it stopped, and the finished transcript is stored with the project (`media/<id>/transcript.json`). The **Transcript** tab reads and searches it, follows playback, jumps to a clicked word, sets the clip's in and out with Shift+click, corrects misheard words (Edit words), and saves the transcript as text or the whole video's subtitles as .srt; corrections are kept with the project and reach every clip's captions.
 - **Captions** are on every clip automatically, cut from the transcript as ClipCheap cuts them: up to two lines of about 32 characters and 3 seconds, paced slightly ahead of the voice, in **Bold** (the spoken word lights up), **Clean**, **Karaoke** (each word fills as it is spoken) or **Pop** (a few words at a time, the spoken one boxed), at the bottom, middle or top, in twelve colours, or **Off**. A line can be changed for one clip only (**Use the transcript's lines** undoes it). Captions follow trims, cut-out pauses and speed, and are burned in on export in Noto Sans (Korean, Japanese, and Chinese in the platform's regional face), with a matching .srt saved beside the clip.

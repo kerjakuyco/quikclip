@@ -290,9 +290,9 @@ impl Session {
     }
     /// Speech to text for a clip's audio (16 kHz mono MP3) with Whisper large v3 turbo, the model clip-ai transcribes with
     /// (service/pipeline.py transcription_model). Local providers have no speech model.
-    pub async fn transcribe(&self, mp3: &[u8]) -> Result<Value> {
+    pub async fn transcribe(&self, mp3: &[u8], language: Option<&str>) -> Result<Value> {
         let audio = STANDARD.encode(mp3);
-        let (route, body) = match self.config.provider {
+        let (route, mut body) = match self.config.provider {
             // Only endpoints that keep nothing and train on nothing (clip-ai PRIVATE_ROUTING).
             Provider::OpenRouter => (
                 "/audio/transcriptions",
@@ -311,6 +311,10 @@ impl Session {
                 ))
             }
         };
+        // A language told up front (ISO 639-1) instead of detected. Both providers take the same field.
+        if let Some(language) = language {
+            body["language"] = json!(language);
+        }
         let response = self
             .json(self.req(reqwest::Method::POST, route).json(&body))
             .await?;
@@ -636,7 +640,7 @@ mod tests {
                 req.respond(Response::from_string(answer.to_string()))
                     .unwrap();
             });
-            let transcript = session.transcribe(b"mp3").await.unwrap();
+            let transcript = session.transcribe(b"mp3", None).await.unwrap();
             assert_eq!(transcript["text"], "hi");
             assert_eq!(
                 crate::captions::transcript_words(&transcript, 5.0),
@@ -660,7 +664,7 @@ mod tests {
         .await
         .unwrap();
         assert!(local
-            .transcribe(b"mp3")
+            .transcribe(b"mp3", None)
             .await
             .unwrap_err()
             .contains("no speech-to-text model"));

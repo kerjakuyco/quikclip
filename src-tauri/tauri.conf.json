@@ -11,7 +11,19 @@
   },
   "app": {
     "windows": [
-      { "label": "main", "title": "Quikclip Studio", "width": 1440, "height": 900, "minWidth": 900, "minHeight": 640, "resizable": true, "backgroundColor": "#121315" }
+      {
+        "label": "main",
+        "title": "Quikclip Studio",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 900,
+        "minHeight": 640,
+        "resizable": true,
+        "visible": false,
+        "theme": "Dark",
+        "backgroundColor": "#1b2028",
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion"
+      }
     ],
     "security": {
       "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost blob: data:; media-src 'self' asset: http://asset.localhost blob:; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost asset: http://asset.localhost; object-src 'none'; base-uri 'self'",

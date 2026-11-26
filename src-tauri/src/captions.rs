@@ -22,6 +22,9 @@ pub struct Cue {
     pub text: String,
     #[serde(default)]
     pub words: Vec<Word>,
+    /// The line in a second language, shown under it ("Show both languages").
+    #[serde(default)]
+    pub translation: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,13 +73,14 @@ struct Request {
     language: Option<String>,
 }
 
-/// KineSnap's twelve caption colours, with ClipCheap's lime (clip-ai CAPTION_COLORS).
+/// Quikclip's twelve caption colours (src/captions.ts CAPTION_COLORS): the studio's own ember, sage and graphite with
+/// colours that hold up over video. Captions are white with an ember highlight unless a clip picks others.
 pub const CAPTION_COLORS: [&str; 12] = [
-    "#FFFFFF", "#FFE500", "#D1F780", "#65E8BF", "#38E8FF", "#69A9FF", "#B79CFF", "#FF8DD5",
-    "#FF735A", "#FFAC38", "#FF5468", "#111111",
+    "#FFFFFF", "#FF8057", "#FFD166", "#93C4A2", "#5EE2C4", "#4CC9F0", "#7B93FF", "#B69CFF",
+    "#FF8CC6", "#FF5A5F", "#F3E6D3", "#121315",
 ];
 const TEXT_COLOR: &str = "#FFFFFF";
-const HIGHLIGHT_COLOR: &str = "#D1F780";
+const HIGHLIGHT_COLOR: &str = "#FF8057";
 const POP_INK: &str = "#141414";
 /// The bundled face (public/fonts, SIL OFL), loaded by libass from the ffmpeg run's own folder.
 pub const FONT: &str = "Noto Sans";
@@ -149,6 +153,10 @@ pub fn parse(json: &str) -> Result<Option<Captions>> {
                 })
                 .filter(|w| !w.text.is_empty())
                 .collect(),
+            translation: cue
+                .translation
+                .map(|t| clean_text(&t, 300))
+                .filter(|t| !t.is_empty()),
         })
         .filter(|cue| !cue.text.is_empty())
         .collect();
@@ -204,6 +212,7 @@ pub fn remap_cues(cues: &[Cue], kept: &[(f64, f64)]) -> Vec<Cue> {
                         text: w.text.clone(),
                     })
                     .collect(),
+                translation: cue.translation.clone(),
             })
         })
         .collect()
@@ -229,6 +238,7 @@ pub fn speed_cues(cues: &[Cue], speed: f64) -> Vec<Cue> {
                     text: w.text.clone(),
                 })
                 .collect(),
+            translation: cue.translation.clone(),
         })
         .collect()
 }
@@ -239,6 +249,7 @@ pub struct Paced {
     pub start: f64,
     pub end: f64,
     pub words: Vec<Word>,
+    pub translation: Option<String>,
     pub fade_in: bool,
     pub fade_out: bool,
 }
@@ -328,6 +339,7 @@ pub fn pace_cues(cues: &[Cue], duration: Option<f64>) -> Vec<Paced> {
             start: round3(start),
             end: round3(end),
             words,
+            translation: cue.translation.clone(),
             fade_in: paced.is_empty() || start - previous > 0.01,
             fade_out: true,
         });
@@ -692,6 +704,31 @@ fn style_events(cue: &Paced, style: Style, size: i64, text: &str, high: &str) ->
     }
 }
 
+/// A cue's second language, as a share of the caption size (clip-ai TRANSLATION_SCALE).
+const TRANSLATION_SCALE: f64 = 0.62;
+
+/// A cue's translation as the end of its caption text (clip-ai _translation): a smaller, plain block under the line in the
+/// caption colour, so it moves with the captions wherever they sit. On Pop's box layer it inherits the hidden alpha; on
+/// karaoke it is a syllable of its own, sung at once, so the last word's sweep doesn't stretch across it.
+fn translation_block(cue: &Paced, size: i64, colour: &str, karaoke: bool) -> String {
+    let Some(text) = cue.translation.as_deref().filter(|t| !t.trim().is_empty()) else {
+        return String::new();
+    };
+    let small = ((size as f64 * TRANSLATION_SCALE).round() as i64).max(1);
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    let width = (MAX_LINE as f64 / TRANSLATION_SCALE).round() as usize;
+    let lines: Vec<String> = wrap_ranges(&parts, width)
+        .into_iter()
+        .map(|(a, b)| ass_text(&join_words(&parts[a..b])))
+        .collect();
+    format!(
+        "{}\\N{{\\fs{small}\\b0\\bord{}\\shad0\\c{colour}}}{}",
+        if karaoke { "{\\k0}" } else { "" },
+        ((small as f64 * 0.08).round() as i64).max(1),
+        lines.join("\\N")
+    )
+}
+
 /// ASS font size at a 1080 px short side (clip-ai CAPTION_SIZES), and the bottom margin and Top start as shares of height.
 fn caption_size(width: u32, height: u32, style: Style) -> f64 {
     let base = match (height.cmp(&width), style) {
@@ -788,8 +825,14 @@ pub fn to_srt(cues: &[Paced]) -> String {
             .into_iter()
             .map(|(a, b)| join_words(&texts[a..b]))
             .collect();
+        // A translated line's second language goes under it, as the video shows it (clip-ai to_srt).
+        let translation = cue
+            .translation
+            .as_deref()
+            .map(|t| format!("\n{t}"))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "{}\n{} --> {}\n{}\n\n",
+            "{}\n{} --> {}\n{}{translation}\n\n",
             index + 1,
             srt_time(cue.start),
             srt_time(cue.end),
@@ -885,7 +928,12 @@ pub fn to_ass(cues: &[Paced], width: u32, height: u32, captions: &Captions) -> S
     let (text_inline, high_inline) = (ass_inline(text), ass_inline(high));
     let events: Vec<String> = cues
         .iter()
-        .flat_map(|cue| style_events(cue, style, size, &text_inline, &high_inline))
+        .flat_map(|cue| {
+            let after = translation_block(cue, size, &text_inline, style == Style::Karaoke);
+            style_events(cue, style, size, &text_inline, &high_inline)
+                .into_iter()
+                .map(move |event| event + &after)
+        })
         .collect();
     let mut script = format!(
         "[Script Info]\nScriptType: v4.00+\nPlayResX: {width}\nPlayResY: {height}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n\
@@ -1001,6 +1049,7 @@ mod tests {
             end: words.last().unwrap().end,
             text: join_words(&words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>()),
             words,
+            translation: None,
         }
     }
     fn look(style: Style) -> Captions {
@@ -1020,12 +1069,12 @@ mod tests {
         assert!(parse("").unwrap().is_none());
         assert!(parse(r#"{"cues":[],"style":"none"}"#).unwrap().is_none());
         assert!(parse(r#"{"cues":[],"style":"shout"}"#).is_err());
-        let c = parse(r##"{"cues":[{"start":0,"end":1,"text":"  hi   there ","words":[{"start":0,"end":0.4,"text":"hi"},{"start":-1,"end":1,"text":"bad"}]},{"start":2,"end":1,"text":"backwards"}],"style":"pop","position":"top","color":"#ff5468","highlight":"#123456","top":300}"##)
+        let c = parse(r##"{"cues":[{"start":0,"end":1,"text":"  hi   there ","words":[{"start":0,"end":0.4,"text":"hi"},{"start":-1,"end":1,"text":"bad"}]},{"start":2,"end":1,"text":"backwards"}],"style":"pop","position":"top","color":"#ff5a5f","highlight":"#123456","top":300}"##)
             .unwrap()
             .unwrap();
         assert_eq!(c.style, Style::Pop);
         assert_eq!(c.position, Position::Top);
-        assert_eq!((c.color, c.highlight), ("#FF5468", HIGHLIGHT_COLOR));
+        assert_eq!((c.color, c.highlight), ("#FF5A5F", HIGHLIGHT_COLOR));
         assert_eq!(c.cues.len(), 1);
         assert_eq!(c.cues[0].text, "hi there");
         assert_eq!(c.top, Some(300.0));
@@ -1083,12 +1132,12 @@ mod tests {
         let bold = to_ass(&paced, 1080, 1920, &look(Style::Bold));
         assert!(bold.contains("PlayResX: 1080\nPlayResY: 1920"));
         assert!(bold.contains("Style: Caption,Noto Sans,70,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,8,3,2,65,65,461,1"));
-        // One event per word, capitals, the spoken one lime (#D1F780 as BGR), braces made harmless.
+        // One event per word, capitals, the spoken one ember (#FF8057 as BGR), braces made harmless.
         assert_eq!(bold.matches("Dialogue: ").count(), 3);
-        assert!(bold.contains("{\\c&H80F7D1&}MAKE{\\c&HFFFFFF&} IT (POP)"));
+        assert!(bold.contains("{\\c&H5780FF&}MAKE{\\c&HFFFFFF&} IT (POP)"));
         let karaoke = to_ass(&paced, 1920, 1080, &look(Style::Karaoke));
         assert!(karaoke.contains("{\\kf"));
-        assert!(karaoke.contains("Style: Caption,Noto Sans,66,&H0080F7D1,&H00FFFFFF"));
+        assert!(karaoke.contains("Style: Caption,Noto Sans,66,&H005780FF,&H00FFFFFF"));
         let pop = to_ass(&paced, 1080, 1080, &look(Style::Pop));
         assert!(pop.contains("Style: PopBox,Noto Sans,96,&H00141414"));
         assert_eq!(pop.matches(",PopBox,").count(), 3);
@@ -1122,6 +1171,36 @@ mod tests {
             Some(3.0),
         );
         assert!(to_ass(&paced, 1080, 1920, &chinese).contains(&format!("Style: Caption,{zh},")));
+    }
+
+    #[test]
+    fn a_translation_sits_under_its_line_smaller_in_the_video_and_the_srt() {
+        let mut both = cue(vec![w(0.5, 1.0, "Hello"), w(1.0, 1.4, "there.")]);
+        both.translation = Some("Hola {ahí}.".into());
+        let paced = pace_cues(&[both], Some(3.0));
+        let bold = to_ass(&paced, 1080, 1920, &look(Style::Bold));
+        // 70 pt captions, 43 pt translation (0.62), plain, in the caption colour; braces made harmless.
+        assert!(bold.contains("\\N{\\fs43\\b0\\bord3\\shad0\\c&HFFFFFF&}Hola (ahí)."));
+        let karaoke = to_ass(&paced, 1080, 1920, &look(Style::Karaoke));
+        assert!(karaoke.contains("{\\k0}\\N{\\fs43"));
+        let pop = to_ass(&paced, 1080, 1920, &look(Style::Pop));
+        assert_eq!(
+            pop.matches("Hola (ahí).").count(),
+            pop.matches("Dialogue: ").count()
+        );
+        assert!(to_srt(&paced).contains("Hello there.\nHola {ahí}.\n\n"));
+        // Through cut pauses and speed.
+        let moved = speed_cues(
+            &remap_cues(&[cue(vec![w(0.0, 1.0, "x")])], &[(0.0, 2.0)]),
+            1.25,
+        );
+        assert_eq!(moved[0].translation, None);
+        let parsed = parse(
+            r#"{"cues":[{"start":0,"end":1,"text":"a","translation":"  b  "}],"style":"clean"}"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.cues[0].translation.as_deref(), Some("b"));
     }
 
     #[test]

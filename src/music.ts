@@ -116,10 +116,11 @@ export function musicRights() {
   }
 }
 
-export function rememberMusicRights() {
+export function saveMusicRights(confirmed: boolean) {
   try {
-    localStorage.setItem(RIGHTS_KEY, 'yes');
+    if (confirmed) localStorage.setItem(RIGHTS_KEY, 'yes');
+    else localStorage.removeItem(RIGHTS_KEY);
   } catch {
-    /* The track can still be added this once. */
+    /* The current session can still use the checkbox. */
   }
 }

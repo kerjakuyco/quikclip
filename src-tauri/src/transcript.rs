@@ -56,20 +56,42 @@ pub async fn transcribe_source(
     app: AppHandle,
     id: String,
     connection: Connection,
+    language: Option<String>,
+    again: bool,
 ) -> Result<Transcript> {
     let key = project_key(&id)?;
     let folder = root(&app)?.join(&key);
-    if let Some(done) = read_done(&folder).await {
+    // Only a two-letter code reaches Whisper; anything else is detected (ClipCheap's job option `language`).
+    let language =
+        language.filter(|code| code.len() == 2 && code.bytes().all(|b| b.is_ascii_lowercase()));
+    if again {
+        if RUNNING
+            .lock()
+            .map_err(|_| "Transcript state unavailable.")?
+            .contains_key(&key)
+        {
+            return Err("This video is already being transcribed.".into());
+        }
+        let _ = fs::remove_file(folder.join(DONE)).await;
+        let _ = fs::remove_dir_all(folder.join(PARTS)).await;
+    } else if let Some(done) = read_done(&folder).await {
         return Ok(done);
     }
     let session = Session::new(connection, None).await?;
     let events = app.clone();
-    transcribe_into(&folder, &key, &session, PART_SECONDS, move |done, total| {
-        let _ = events.emit(
-            "studio-transcript",
-            serde_json::json!({ "id": id, "done": done, "total": total }),
-        );
-    })
+    transcribe_into(
+        &folder,
+        &key,
+        &session,
+        PART_SECONDS,
+        language.as_deref(),
+        move |done, total| {
+            let _ = events.emit(
+                "studio-transcript",
+                serde_json::json!({ "id": id, "done": done, "total": total }),
+            );
+        },
+    )
     .await
 }
 
@@ -107,11 +129,11 @@ fn transient(error: &str) -> bool {
         .any(|code| error.contains(code))
 }
 
-async fn part(session: &Session, file: &Path) -> Result<Value> {
+async fn part(session: &Session, file: &Path, language: Option<&str>) -> Result<Value> {
     let mp3 = fs::read(file).await.map_err(|e| e.to_string())?;
     let mut attempt = 0;
     loop {
-        match session.transcribe(&mp3).await {
+        match session.transcribe(&mp3, language).await {
             Ok(value) => return Ok(value),
             Err(error) if attempt + 1 < ATTEMPTS && transient(&error) => {
                 tokio::time::sleep(Duration::from_secs(BACKOFF_SECONDS[attempt])).await;
@@ -153,6 +175,7 @@ async fn transcribe_into(
     key: &str,
     session: &Session,
     part_seconds: f64,
+    language: Option<&str>,
     progress: impl Fn(usize, usize),
 ) -> Result<Transcript> {
     if let Some(done) = read_done(folder).await {
@@ -180,7 +203,7 @@ async fn transcribe_into(
     let made = tokio::select! {
         biased;
         _ = stopped.changed() => Err("Transcription stopped.".to_string()),
-        made = make(folder, &video, duration, session, part_seconds, &progress) => made,
+        made = make(folder, &video, duration, session, part_seconds, language, &progress) => made,
     };
     if let Ok(mut running) = RUNNING.lock() {
         running.remove(key);
@@ -194,10 +217,23 @@ async fn make(
     duration: f64,
     session: &Session,
     part_seconds: f64,
+    language: Option<&str>,
     progress: &impl Fn(usize, usize),
 ) -> Result<Transcript> {
     let kept = folder.join(PARTS);
+    // Parts kept from a run in another language are no use to this one.
+    let marker = kept.join("language");
+    let wanted = language.unwrap_or("auto");
+    if fs::read_to_string(&marker)
+        .await
+        .is_ok_and(|was| was != wanted)
+    {
+        let _ = fs::remove_dir_all(&kept).await;
+    }
     fs::create_dir_all(&kept).await.map_err(|e| e.to_string())?;
+    fs::write(&marker, wanted)
+        .await
+        .map_err(|e| e.to_string())?;
     // The audio alone, split as it is written: one pass over the source, however long.
     let audio = tempfile::tempdir().map_err(|e| e.to_string())?;
     let pattern = audio.path().join("%03d.mp3");
@@ -254,11 +290,12 @@ async fn make(
             let Some(index) = pending.pop_front() else {
                 break;
             };
-            let (session, file) = (
+            let (session, file, language) = (
                 session.clone(),
                 audio.path().join(format!("{index:03}.mp3")),
+                language.map(str::to_owned),
             );
-            flight.spawn(async move { (index, part(&session, &file).await) });
+            flight.spawn(async move { (index, part(&session, &file, language.as_deref()).await) });
         }
         let Some(joined) = flight.join_next().await else {
             break;
@@ -285,6 +322,10 @@ async fn make(
         transcript.words.extend(transcript_words(value, offset));
         transcript.segments.extend(segments_of(value, offset));
         transcript.language = transcript.language.or_else(|| transcript_language(value));
+    }
+    // A language the user chose wins over what Whisper guessed, so the captions take that face.
+    if let Some(code) = language {
+        transcript.language = Some(code.to_owned());
     }
     write_done(folder, &transcript).await?;
     let _ = fs::remove_dir_all(&kept).await;
@@ -382,7 +423,7 @@ mod tests {
         )
         .unwrap();
         let seen = Mutex::new(Vec::new());
-        let transcript = transcribe_into(&folder, "resume", &session, 2.0, |done, total| {
+        let transcript = transcribe_into(&folder, "resume", &session, 2.0, None, |done, total| {
             seen.lock().unwrap().push((done, total))
         })
         .await
@@ -412,7 +453,7 @@ mod tests {
         assert!(folder.join(DONE).is_file());
         assert!(!folder.join(PARTS).exists());
         // Made once: the next call reads it back without asking again.
-        let again = transcribe_into(&folder, "resume", &session, 2.0, |_, _| {})
+        let again = transcribe_into(&folder, "resume", &session, 2.0, None, |_, _| {})
             .await
             .unwrap();
         assert_eq!(again, transcript);
@@ -454,7 +495,7 @@ mod tests {
         .unwrap()
         // Nothing listens here: a request would fail, and none is made.
         .with_base("http://127.0.0.1:9".into());
-        let empty = transcribe_into(&silent, "silent", &session, 600.0, |_, _| {})
+        let empty = transcribe_into(&silent, "silent", &session, 600.0, None, |_, _| {})
             .await
             .unwrap();
         assert_eq!(empty, Transcript::default());
@@ -463,7 +504,7 @@ mod tests {
         talk(&loud, "3").await;
         let running = tokio::spawn({
             let (loud, session) = (loud.clone(), session.clone());
-            async move { transcribe_into(&loud, "loud", &session, 600.0, |_, _| {}).await }
+            async move { transcribe_into(&loud, "loud", &session, 600.0, None, |_, _| {}).await }
         });
         while !RUNNING.lock().unwrap().contains_key("loud") {
             tokio::time::sleep(Duration::from_millis(10)).await;

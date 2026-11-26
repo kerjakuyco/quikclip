@@ -174,8 +174,22 @@ pub async fn transcribe_source(
     app: AppHandle,
     id: String,
     connection: crate::providers::Connection,
+    language: Option<String>,
+    again: Option<bool>,
 ) -> Result<crate::transcript::Transcript> {
-    crate::transcript::transcribe_source(app, id, connection).await
+    crate::transcript::transcribe_source(app, id, connection, language, again.unwrap_or(false))
+        .await
+}
+
+/// Caption lines in another language, one per line. Not a job: it is quick and the editor stays usable.
+#[tauri::command]
+pub async fn translate_captions(
+    connection: crate::providers::Connection,
+    model: String,
+    language: String,
+    lines: Vec<String>,
+) -> Result<Vec<String>> {
+    crate::translate::translate_lines(connection, model, language, lines).await
 }
 
 #[tauri::command]

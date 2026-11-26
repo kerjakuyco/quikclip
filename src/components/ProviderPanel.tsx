@@ -69,6 +69,21 @@ export function transcriptionConnection(): { connection: Connection; label: stri
   return null;
 }
 
+/** The model Highlight finder would use, for a short caption translation. */
+export function suggestionModel(): { connection: Connection; model: string } | null {
+  const settings = readSaved<Settings>(storageKey, initial);
+  const order = [settings.active, 'cloudflare', 'openrouter', 'ollama', 'lmstudio'] as Provider[];
+  const seen = new Set<Provider>();
+  for (const provider of order) {
+    if (seen.has(provider)) continue;
+    seen.add(provider);
+    const profile = settings.profiles?.[provider];
+    const model = profile?.model?.trim();
+    if (profile?.connection && model) return { connection: profile.connection, model };
+  }
+  return null;
+}
+
 const defaults = (provider: Provider): Connection =>
   provider === 'cloudflare'
     ? { provider, gateway: 'default', accountId: '' }

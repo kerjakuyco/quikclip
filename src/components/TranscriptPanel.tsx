@@ -1,6 +1,7 @@
 import { memo, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import { Check, Download, Pencil, Search } from 'lucide-react';
 import {
+  TRANSLATE_LANGUAGES,
   readingLines,
   type IndexedWord,
   type Transcript,
@@ -8,6 +9,38 @@ import {
   type TranscriptLine,
 } from '../captions';
 import { clock } from '../studio';
+
+/** Whisper's language for this video, or Detect. */
+function SpokenLanguage({
+  value,
+  onChange,
+  again,
+}: {
+  value: string;
+  onChange: (code: string) => void;
+  again?: () => void;
+}) {
+  return (
+    <div className="spoken-row">
+      <label>
+        Spoken language
+        <select value={value} onChange={(e) => onChange(e.target.value)}>
+          <option value="auto">Detect</option>
+          {TRANSLATE_LANGUAGES.map((item) => (
+            <option key={item.code} value={item.code}>
+              {item.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      {again && (
+        <button type="button" className="text-btn" onClick={again}>
+          Transcribe again
+        </button>
+      )}
+    </div>
+  );
+}
 
 /** How a project's transcript is coming along when it isn't ready. */
 export type TranscriptStatus =
@@ -99,7 +132,9 @@ export function TranscriptPanel({
   onSeek,
   onRange,
   onFix,
-  onRetry,
+  language,
+  onLanguage,
+  onTranscribe,
   onConnect,
   onDownload,
 }: {
@@ -113,7 +148,11 @@ export function TranscriptPanel({
   onSeek: (time: number) => void;
   onRange: (start: number, end: number) => void;
   onFix: (index: number, text: string) => void;
-  onRetry: () => void;
+  /** Whisper's language for the next run: `auto` detects it. */
+  language: string;
+  onLanguage: (code: string) => void;
+  /** `again` throws away a finished transcript and makes it once more. */
+  onTranscribe: (again: boolean) => void;
   onConnect: () => void;
   /** Saves the transcript as text, or the whole video's subtitles. */
   onDownload: (kind: 'txt' | 'srt') => void;
@@ -213,7 +252,8 @@ export function TranscriptPanel({
             <>
               <strong>The transcript stopped.</strong>
               <p className="caption-error">{status.text}</p>
-              <button type="button" className="sound-toggle" onClick={onRetry}>
+              <SpokenLanguage value={language} onChange={onLanguage} />
+              <button type="button" className="sound-toggle" onClick={() => onTranscribe(false)}>
                 Try again
               </button>
             </>
@@ -227,7 +267,8 @@ export function TranscriptPanel({
               <button type="button" className="sound-toggle" onClick={onConnect}>
                 Open Highlight finder
               </button>
-              <button type="button" className="text-btn" onClick={onRetry}>
+              <SpokenLanguage value={language} onChange={onLanguage} />
+              <button type="button" className="text-btn" onClick={() => onTranscribe(false)}>
                 Transcribe now
               </button>
             </>
@@ -249,6 +290,7 @@ export function TranscriptPanel({
   }
   return (
     <div className="transcript-panel">
+      <SpokenLanguage value={language} onChange={onLanguage} again={() => onTranscribe(true)} />
       <div className="transcript-tools">
         <label className="transcript-search">
           <Search size={13} aria-hidden="true" />

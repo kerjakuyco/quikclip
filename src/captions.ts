@@ -9,11 +9,17 @@
  *   time and waits through pauses, Pop shows short groups with a box on the word being said.
  */
 export type TimedText = { start: number; end: number; text: string };
-export type Cue = { start: number; end: number; text: string; words: TimedText[] };
+export type Cue = {
+  start: number;
+  end: number;
+  text: string;
+  words: TimedText[];
+  /** A second language under this line, when the clip shows both. */
+  translation?: string;
+};
 export type CaptionStyle = 'bold' | 'clean' | 'karaoke' | 'pop' | 'none';
 export type CaptionPosition = 'bottom' | 'middle' | 'top';
 
-/** A clip's captions. Words stay on the source's clock, so trimming the clip keeps them; cues are cut for its range. */
 /**
  * A clip's captions: its look, and (only once its lines are changed by hand) its own words for [from, to] on the source
  * clock. Every other word comes from the project's transcript, so a fix there reaches every clip (clip-clients side-panel
@@ -27,6 +33,43 @@ export type CutCaptions = {
   words?: TimedText[];
   from?: number;
   to?: number;
+  /** This clip's lines in another language, matched to the source time they were spoken (`at`). */
+  translation?: CaptionTranslation;
+};
+
+/** The languages captions translate into. The same codes and names reach the model (src-tauri translate.rs). */
+export const TRANSLATE_LANGUAGES = [
+  { code: 'en', name: 'English' },
+  { code: 'es', name: 'Spanish' },
+  { code: 'pt', name: 'Portuguese (Brazil)' },
+  { code: 'fr', name: 'French' },
+  { code: 'de', name: 'German' },
+  { code: 'it', name: 'Italian' },
+  { code: 'nl', name: 'Dutch' },
+  { code: 'pl', name: 'Polish' },
+  { code: 'tr', name: 'Turkish' },
+  { code: 'ru', name: 'Russian' },
+  { code: 'ar', name: 'Arabic' },
+  { code: 'hi', name: 'Hindi' },
+  { code: 'id', name: 'Indonesian' },
+  { code: 'ms', name: 'Malay' },
+  { code: 'tl', name: 'Filipino' },
+  { code: 'vi', name: 'Vietnamese' },
+  { code: 'th', name: 'Thai' },
+  { code: 'ja', name: 'Japanese' },
+  { code: 'ko', name: 'Korean' },
+  { code: 'zh', name: 'Chinese (Simplified)' },
+] as const;
+export type TranslateLanguage = (typeof TRANSLATE_LANGUAGES)[number]['code'];
+export const languageName = (code: string) =>
+  TRANSLATE_LANGUAGES.find((item) => item.code === code)?.name ?? code;
+
+/** One translated line, kept at the source time of the caption it belongs to so a trim still finds it. */
+export type TranslationLine = { at: number; line: string };
+export type CaptionTranslation = {
+  language: TranslateLanguage;
+  both: boolean;
+  lines: TranslationLine[];
 };
 
 /** A video's transcript on the source clock (src-tauri transcript.rs): Whisper's segments and timed words. */
@@ -46,23 +89,24 @@ export const CAPTION_STYLES: { value: CaptionStyle; label: string; description: 
   { value: 'pop', label: 'Pop', description: 'A few words at a time, the spoken one boxed' },
   { value: 'none', label: 'Off', description: 'No text on the video' },
 ];
-/** KineSnap's twelve caption colours, with ClipCheap's lime (clip-ai CAPTION_COLORS). */
+/** Quikclip's twelve caption colours: the studio's ember, sage and graphite (studio.css --accent, --green, --bg) with
+ *  colours that hold up over video. Captions are white with an ember highlight unless a clip picks others. */
 export const CAPTION_COLORS = [
   { value: '#FFFFFF', label: 'White' },
-  { value: '#FFE500', label: 'Yellow' },
-  { value: '#D1F780', label: 'Lime' },
-  { value: '#65E8BF', label: 'Mint' },
-  { value: '#38E8FF', label: 'Cyan' },
-  { value: '#69A9FF', label: 'Blue' },
-  { value: '#B79CFF', label: 'Purple' },
-  { value: '#FF8DD5', label: 'Pink' },
-  { value: '#FF735A', label: 'Coral' },
-  { value: '#FFAC38', label: 'Orange' },
-  { value: '#FF5468', label: 'Red' },
-  { value: '#111111', label: 'Black' },
+  { value: '#FF8057', label: 'Ember' },
+  { value: '#FFD166', label: 'Sun' },
+  { value: '#93C4A2', label: 'Sage' },
+  { value: '#5EE2C4', label: 'Mint' },
+  { value: '#4CC9F0', label: 'Sky' },
+  { value: '#7B93FF', label: 'Cobalt' },
+  { value: '#B69CFF', label: 'Iris' },
+  { value: '#FF8CC6', label: 'Rose' },
+  { value: '#FF5A5F', label: 'Signal' },
+  { value: '#F3E6D3', label: 'Cream' },
+  { value: '#121315', label: 'Graphite' },
 ] as const;
 export const TEXT_COLOR = '#FFFFFF';
-export const HIGHLIGHT_COLOR = '#D1F780';
+export const HIGHLIGHT_COLOR = '#FF8057';
 export const CAPTION_POSITIONS: { value: CaptionPosition; label: string }[] = [
   { value: 'bottom', label: 'Bottom' },
   { value: 'middle', label: 'Middle' },
@@ -415,7 +459,8 @@ export function toSrt(cues: PacedCue[]) {
     .map((cue, index) => {
       const texts = cue.words.map((w) => w.text);
       const lines = wrapRanges(texts).map(([a, b]) => joinWords(texts.slice(a, b)));
-      return `${index + 1}\n${srtTime(cue.start)} --> ${srtTime(cue.end)}\n${lines.join('\n')}\n`;
+      const translation = cue.translation ? `\n${cue.translation}` : '';
+      return `${index + 1}\n${srtTime(cue.start)} --> ${srtTime(cue.end)}\n${lines.join('\n')}${translation}\n`;
     })
     .join('\n');
 }
@@ -462,6 +507,31 @@ const known = (color: unknown, fallback: string) =>
   CAPTION_COLORS.find((option) => option.value === String(color ?? '').toUpperCase())?.value ??
   fallback;
 
+const LINE_NEAR = 0.08;
+function cleanLine(line: string, limit: number) {
+  const text = line.replace(/\s+/g, ' ').trim();
+  if (text.length <= limit) return text;
+  const cut = text.slice(0, limit).replace(/\s+\S*$/u, '');
+  return (cut || text.slice(0, limit)).trim();
+}
+function ownTranslation(value: unknown): CaptionTranslation | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const raw = value as { language?: unknown; both?: unknown; lines?: unknown };
+  const language = TRANSLATE_LANGUAGES.find((item) => item.code === raw.language)?.code;
+  if (!language || !Array.isArray(raw.lines)) return undefined;
+  const lines = raw.lines
+    .flatMap((item) => {
+      if (!item || typeof item !== 'object') return [];
+      const at = (item as { at?: unknown }).at;
+      const line = (item as { line?: unknown }).line;
+      if (typeof at !== 'number' || !Number.isFinite(at) || typeof line !== 'string') return [];
+      const text = cleanLine(line, 300);
+      return text ? [{ at, line: text }] : [];
+    })
+    .slice(0, 400);
+  return lines.length ? { language, both: raw.both === true, lines } : undefined;
+}
+
 const finite = (start: unknown, end: unknown) =>
   typeof start === 'number' &&
   typeof end === 'number' &&
@@ -476,11 +546,12 @@ const ownWords = (words: unknown): TimedText[] | undefined =>
         .map((w) => ({ start: w.start, end: w.end, text: w.text.trim().slice(0, 64) }))
     : undefined;
 
-/** A clip's captions as they show: Bold at the bottom in white and lime unless the clip chose otherwise. */
+/** A clip's captions as they show: Bold at the bottom, white with an ember highlight, unless the clip chose otherwise. */
 export function cutCaptions(cut: { captions?: Partial<CutCaptions> | null }): CutCaptions {
   const c = cut.captions ?? {};
   const words = ownWords(c.words);
   const own = words && finite(c.from, c.to);
+  const translation = ownTranslation(c.translation);
   return {
     style: CAPTION_STYLES.some((s) => s.value === c.style) ? (c.style as CaptionStyle) : 'bold',
     position: CAPTION_POSITIONS.some((p) => p.value === c.position)
@@ -489,7 +560,54 @@ export function cutCaptions(cut: { captions?: Partial<CutCaptions> | null }): Cu
     color: known(c.color, TEXT_COLOR),
     highlight: known(c.highlight, HIGHLIGHT_COLOR),
     ...(own ? { words, from: c.from, to: c.to } : {}),
+    ...(translation ? { translation } : {}),
   };
+}
+
+/** The translated line spoken at `at` on the source clock, if this clip has one. */
+export function translationAt(lines: TranslationLine[], at: number) {
+  return lines.find((item) => Math.abs(item.at - at) < LINE_NEAR)?.line;
+}
+
+/**
+ * Cues as they show and export (clip-clients translatedCues): under the original line, or in its place with the words
+ * spread over the same time. A line with no translation stays as the transcript said it.
+ */
+export function presentCues(
+  cues: Cue[],
+  translation: CaptionTranslation | undefined,
+  origin: number,
+): Cue[] {
+  if (!translation) return cues;
+  return cues.map((cue) => {
+    const line = translationAt(translation.lines, origin + cue.start);
+    if (!line) return { ...cue, translation: undefined };
+    if (translation.both) return { ...cue, translation: line };
+    const text = cleanLine(line, 200);
+    return {
+      ...cue,
+      text,
+      words: proportionalWords(text, cue.start, cue.end),
+      translation: undefined,
+    };
+  });
+}
+
+/** One translated line replaced or cleared. `at` is its time on the source clock. */
+export function writeTranslationLine(captions: CutCaptions, at: number, line: string): CutCaptions {
+  const current = captions.translation;
+  if (!current) return captions;
+  const text = cleanLine(line, 300);
+  const lines = current.lines.filter((item) => Math.abs(item.at - at) >= LINE_NEAR);
+  if (text) lines.push({ at, line: text });
+  lines.sort((a, b) => a.at - b.at);
+  return { ...captions, translation: { ...current, lines } };
+}
+
+/** The translation dropped: the clip's captions are the transcript's language again. */
+export function clearTranslation(captions: CutCaptions): CutCaptions {
+  const { translation: _drop, ...rest } = captions;
+  return rest;
 }
 
 /** The transcript's words with the project's corrections: a fixed word keeps its time, an emptied one goes. */

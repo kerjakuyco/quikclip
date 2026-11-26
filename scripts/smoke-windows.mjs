@@ -80,6 +80,10 @@ try {
   await expect(page.getByRole('heading', { name: 'Alpine field notes' })).toBeVisible({
     timeout: 20000,
   });
+  const windowControls = page.getByRole('group', { name: 'Window controls' });
+  await windowControls.getByRole('button', { name: 'Maximize window' }).click();
+  await windowControls.getByRole('button', { name: 'Restore window' }).click();
+  await expect(windowControls.getByRole('button', { name: 'Maximize window' })).toBeVisible();
   await page.getByRole('button', { name: 'Play', exact: true }).click();
   await expect
     .poll(() => page.locator('video').evaluate((v) => v.currentTime))
@@ -98,7 +102,7 @@ try {
   });
   expect(receivedImage).toBeTruthy();
   console.log(
-    'Verified bundled tools without PATH, playback, native IPC, model selection and analyzed contact sheet.',
+    'Verified bundled tools without PATH, Windows title bar, playback, native IPC, model selection and analyzed contact sheet.',
   );
 } finally {
   modelServer.close();
