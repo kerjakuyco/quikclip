@@ -1,10 +1,15 @@
 import { headlineText, paintHeadline } from './headline';
 import { logoFit, type LogoCorner } from './logo';
-import { musicBed, type MusicSettings } from './music';
+import { musicBed, musicMix, type MusicMix } from './music';
 import { hearPauses, keptTime } from './pauses';
 import { cutSpeed, VoicePace } from './speed';
 import {
   browserBlob,
+  browserFrame,
+  cropBox,
+  cropFrame,
+  cropRect,
+  cutCrop,
   cutFit,
   cutLogo,
   cutMusic,
@@ -15,7 +20,12 @@ import {
   type Project,
   type Cut,
 } from './studio';
-import type { AudioSample, VideoSample } from 'mediabunny';
+import type {
+  AudioSample,
+  AudioSampleSource,
+  ConversionVideoOptions,
+  VideoSample,
+} from 'mediabunny';
 
 /** Whole picture on a darkened blurred fill. The cover is drawn larger so the blur stays inside the frame. */
 function paintBlur(sample: VideoSample, width: number, height: number) {
@@ -38,6 +48,51 @@ function paintBlur(sample: VideoSample, width: number, height: number) {
     sw * contain,
     sh * contain,
   );
+  sample.close();
+  return canvas;
+}
+
+/** The split layout: the face band cropped from the source on top, the whole picture on a blurred copy below. */
+function paintSplit(
+  sample: VideoSample,
+  width: number,
+  height: number,
+  face: { left: number; top: number; width: number; height: number },
+  share: number,
+) {
+  const canvas = new OffscreenCanvas(width, height);
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw Error('This browser cannot draw the split layout.');
+  const top = Math.round(height * share);
+  const bottom = height - top;
+  const sw = sample.displayWidth;
+  const sh = sample.displayHeight;
+  sample.draw(ctx, face.left, face.top, face.width, face.height, 0, 0, width, top);
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, top, width, bottom);
+  ctx.clip();
+  ctx.fillStyle = '#09090a';
+  ctx.fillRect(0, top, width, bottom);
+  const cover = Math.max(width / sw, bottom / sh) * 1.12;
+  ctx.filter = 'blur(14px) brightness(0.82)';
+  sample.draw(
+    ctx,
+    (width - sw * cover) / 2,
+    top + (bottom - sh * cover) / 2,
+    sw * cover,
+    sh * cover,
+  );
+  ctx.filter = 'none';
+  const contain = Math.min(width / sw, bottom / sh);
+  sample.draw(
+    ctx,
+    (width - sw * contain) / 2,
+    top + (bottom - sh * contain) / 2,
+    sw * contain,
+    sh * contain,
+  );
+  ctx.restore();
   sample.close();
   return canvas;
 }
@@ -130,45 +185,42 @@ function highpass90(
   return next;
 }
 
-/** The desktop export evens the mixed level with loudnorm. Here the track is added at the preview level. */
+/** Mix in place at preview levels. Desktop export also normalizes the mixed loudness. */
+function soundtrack(buffer: AudioBuffer, settings: MusicMix, length: number) {
+  const lanes = Array.from({ length: buffer.numberOfChannels }, (_, index) =>
+    buffer.getChannelData(index),
+  );
+  return (data: Float32Array, channels: number, rate: number, time: number) => {
+    const frames = data.length / channels;
+    for (let i = 0; i < frames; i++) {
+      const at = musicBed(time + i / rate, settings, buffer.duration, length);
+      for (let c = 0; c < channels; c++) {
+        let add = 0;
+        if (at.position !== null && at.volume > 0) {
+          const pos = at.position * buffer.sampleRate;
+          const index = Math.floor(pos);
+          const lane = lanes[Math.min(c, lanes.length - 1)];
+          const left = lane[index] ?? 0;
+          const right = lane[index + 1] ?? left;
+          add = (left + (right - left) * (pos - index)) * at.volume;
+        }
+        const index = i * channels + c;
+        data[index] = Math.max(-1, Math.min(1, data[index] * settings.source_volume + add));
+      }
+    }
+  };
+}
+
 function mixUnder(
-  make: new (init: {
-    data: Float32Array;
-    format: 'f32';
-    numberOfChannels: number;
-    sampleRate: number;
-    timestamp: number;
-  }) => AudioSample,
+  make: typeof AudioSample,
   sample: AudioSample,
-  buffer: AudioBuffer,
-  music: MusicSettings,
-  length: number,
+  mix: ReturnType<typeof soundtrack>,
 ) {
   const frames = sample.numberOfFrames;
   const channels = sample.numberOfChannels;
   const data = new Float32Array(frames * channels);
   sample.copyTo(data, { planeIndex: 0, format: 'f32', frameCount: frames });
-  const lanes = Array.from({ length: buffer.numberOfChannels }, (_, index) =>
-    buffer.getChannelData(index),
-  );
-  const musicRate = buffer.sampleRate;
-  for (let i = 0; i < frames; i++) {
-    const at = musicBed(sample.timestamp + i / sample.sampleRate, music, buffer.duration, length);
-    for (let c = 0; c < channels; c++) {
-      let add = 0;
-      if (at.position !== null && at.volume > 0) {
-        const pos = at.position * musicRate;
-        const index = Math.floor(pos);
-        const frac = pos - index;
-        const lane = lanes[buffer.numberOfChannels === 1 ? 0 : Math.min(c, lanes.length - 1)];
-        const left = lane[index] ?? 0;
-        const right = lane[index + 1] ?? left;
-        add = (left + (right - left) * frac) * at.volume;
-      }
-      const mixed = data[i * channels + c] + add;
-      data[i * channels + c] = mixed < -1 ? -1 : mixed > 1 ? 1 : mixed;
-    }
-  }
+  mix(data, channels, sample.sampleRate, sample.timestamp);
   const next = new make({
     data,
     format: 'f32',
@@ -178,6 +230,38 @@ function mixUnder(
   });
   sample.close();
   return next;
+}
+
+/** A silent source needs its own output audio track. Write bounded blocks, not a clip-sized buffer. */
+async function writeSoundtrack(
+  make: typeof AudioSample,
+  track: AudioSampleSource,
+  mix: ReturnType<typeof soundtrack>,
+  length: number,
+  signal: AbortSignal,
+) {
+  const sampleRate = 48000;
+  const channels = 2;
+  const total = Math.round(length * sampleRate);
+  for (let written = 0; written < total; written += 4800) {
+    signal.throwIfAborted();
+    const data = new Float32Array(Math.min(4800, total - written) * channels);
+    const timestamp = written / sampleRate;
+    mix(data, channels, sampleRate, timestamp);
+    const sample = new make({
+      data,
+      format: 'f32',
+      numberOfChannels: channels,
+      sampleRate,
+      timestamp,
+    });
+    try {
+      await track.add(sample);
+    } finally {
+      sample.close();
+    }
+  }
+  track.close();
 }
 
 async function decodeBed(blob: Blob) {
@@ -209,22 +293,25 @@ export async function exportWeb(
     MATROSKA,
     MP4,
     QTFF,
+    WEBM,
     Output,
     WebMOutputFormat,
     BufferTarget,
     Conversion,
     AudioSample,
+    AudioSampleSource,
     VideoSample,
   } = await import('mediabunny');
   const blob =
     project.id === 'sample'
       ? await (await fetch(src, { signal })).blob()
       : await browserBlob(project.id);
-  const input = new Input({ source: new BlobSource(blob), formats: [MP4, QTFF, MATROSKA] });
-  const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
-  const ratio =
-    cut.shape === 'vertical' ? 9 / 16 : cut.shape === 'square' ? 1 : project.width / project.height;
   const blur = cut.shape !== 'source' && cutFit(cut) === 'blur';
+  const split = cut.shape !== 'source' && cutFit(cut) === 'split';
+  const crop = cropFrame(cut, project.width, project.height);
+  const box = cropBox(cut, project.width, project.height);
+  const face = cropRect(box, cutCrop(cut), project.width, project.height);
+  const { width, height } = browserFrame(crop);
   const text = headlineText(cut.headline);
   const voice = cutVoice(cut);
   const music = cutMusic(cut);
@@ -235,9 +322,9 @@ export async function exportWeb(
   const pace = cutSpeed(cut);
   const spoken = heard && heard.kept ? heard.spoken : cut.end - cut.start;
   const length = pace === 1 ? spoken : spoken / pace;
-  const h = Math.min(project.height, project.width / ratio, 1080);
-  const width = Math.max(2, 2 * Math.floor((h * ratio) / 2));
-  const height = Math.max(2, 2 * Math.floor(h / 2));
+  const mix = music && bed ? soundtrack(bed, musicMix(music, bed.duration), length) : null;
+  const input = new Input({ source: new BlobSource(blob), formats: [MP4, QTFF, MATROSKA, WEBM] });
+  const output = new Output({ format: new WebMOutputFormat(), target: new BufferTarget() });
   const ears: Ears[] = [];
   const voicePace = new VoicePace();
   let cancel: (() => void) | undefined;
@@ -268,8 +355,16 @@ export async function exportWeb(
   };
   try {
     if (logo) mark = await loadMark(await logoBlob(logo.source));
+    const bedTrack =
+      mix && !(await input.getPrimaryAudioTrack())
+        ? new AudioSampleSource({ codec: 'opus', bitrate: 128000 })
+        : null;
+    if (bedTrack) {
+      output.addAudioTrack(bedTrack);
+      output.setMetadataTags({ title: cut.title });
+    }
     signal.throwIfAborted();
-    const draw = Boolean(blur || text || mark);
+    const draw = Boolean(blur || split || text || mark);
     const decorate = (canvas: OffscreenCanvas) => {
       const ctx = canvas.getContext('2d');
       if (!ctx) {
@@ -279,86 +374,49 @@ export async function exportWeb(
             : 'This browser cannot draw the logo.',
         );
       }
-      if (text) paintHeadline(ctx, cut.shape, width, height, text);
+      if (text) paintHeadline(ctx, width, height, text);
       if (mark && logo) paintLogo(ctx, width, height, mark, logo.corner);
       return canvas;
     };
+    const video: ConversionVideoOptions = { codec: 'vp8' };
+    if (!blur && !split) {
+      // Crop in source pixels before resizing, including when overlays or speed are enabled.
+      Object.assign(video, { width, height, fit: 'fill' });
+      if (cut.shape !== 'source') video.crop = crop;
+    }
+    if (draw) {
+      video.processedWidth = width;
+      video.processedHeight = height;
+    }
+    if (draw || kept || pace !== 1) {
+      video.process = (sample) => {
+        const at = kept ? keptTime(sample.timestamp, kept) : sample.timestamp;
+        if (at === null) {
+          sample.close();
+          return null;
+        }
+        const duration = sample.duration / pace;
+        if (!draw) {
+          sample.setTimestamp(at / pace);
+          if (pace !== 1) sample.setDuration(duration);
+          return sample;
+        }
+        const canvas = decorate(
+          blur
+            ? paintBlur(sample, width, height)
+            : split
+              ? paintSplit(sample, width, height, face, box.height / crop.height)
+              : drawFrame(sample, width, height),
+        );
+        return new VideoSample(canvas, { timestamp: at / pace, duration });
+      };
+    }
     const conversion = await Conversion.init({
       input,
       output,
       tracks: 'primary',
       trim: { start: cut.start, end: cut.end },
-      video:
-        pace === 1
-          ? kept
-            ? {
-                codec: 'vp8',
-                ...(draw
-                  ? {
-                      ...(blur ? {} : { width, height, fit: 'cover' as const }),
-                      processedWidth: width,
-                      processedHeight: height,
-                    }
-                  : { width, height, fit: 'cover' as const }),
-                process: (sample) => {
-                  const at = keptTime(sample.timestamp, kept);
-                  const frameDuration = sample.duration;
-                  if (at === null) {
-                    sample.close();
-                    return null;
-                  }
-                  if (!draw) {
-                    sample.setTimestamp(at);
-                    return sample;
-                  }
-                  const canvas = decorate(
-                    blur ? paintBlur(sample, width, height) : drawFrame(sample, width, height),
-                  );
-                  return new VideoSample(canvas, { timestamp: at, duration: frameDuration });
-                },
-              }
-            : draw
-              ? {
-                  codec: 'vp8',
-                  ...(blur ? {} : { width, height, fit: 'cover' as const }),
-                  processedWidth: width,
-                  processedHeight: height,
-                  process: (sample) =>
-                    decorate(
-                      blur ? paintBlur(sample, width, height) : drawFrame(sample, width, height),
-                    ),
-                }
-              : {
-                  codec: 'vp8',
-                  width,
-                  height,
-                  fit: 'cover',
-                }
-          : {
-              codec: 'vp8' as const,
-              ...(draw && blur ? {} : { width, height, fit: 'cover' as const }),
-              ...(draw ? { processedWidth: width, processedHeight: height } : {}),
-              process: (sample) => {
-                const frameDuration = sample.duration;
-                const at = kept ? keptTime(sample.timestamp, kept) : sample.timestamp;
-                if (at === null) {
-                  sample.close();
-                  return null;
-                }
-                if (!draw) {
-                  sample.setTimestamp(at / pace);
-                  sample.setDuration(frameDuration / pace);
-                  return sample;
-                }
-                const canvas = decorate(
-                  blur ? paintBlur(sample, width, height) : drawFrame(sample, width, height),
-                );
-                return new VideoSample(canvas, {
-                  timestamp: at / pace,
-                  duration: frameDuration / pace,
-                });
-              },
-            },
+      video,
       audio:
         pace === 1
           ? kept
@@ -370,22 +428,18 @@ export async function exportWeb(
                   if (!pieces.length) return null;
                   const mixed = pieces.map((piece) => {
                     const voiced = voice ? highpass90(AudioSample, piece, ears) : piece;
-                    return bed && music
-                      ? mixUnder(AudioSample, voiced, bed, music, length)
-                      : voiced;
+                    return mix ? mixUnder(AudioSample, voiced, mix) : voiced;
                   });
                   return mixed.length === 1 ? mixed[0] : mixed;
                 },
               }
-            : voice || bed
+            : voice || mix
               ? {
                   codec: 'opus',
                   sampleRate: 48000,
                   process: (sample) => {
                     const voiced = voice ? highpass90(AudioSample, sample, ears) : sample;
-                    return bed && music
-                      ? mixUnder(AudioSample, voiced, bed, music, length)
-                      : voiced;
+                    return mix ? mixUnder(AudioSample, voiced, mix) : voiced;
                   },
                 }
               : { codec: 'opus', sampleRate: 48000 }
@@ -414,12 +468,12 @@ export async function exportWeb(
                     timestamp: piece.timestamp,
                   });
                   const voiced = voice ? highpass90(AudioSample, made, ears) : made;
-                  return bed && music ? mixUnder(AudioSample, voiced, bed, music, length) : voiced;
+                  return mix ? mixUnder(AudioSample, voiced, mix) : voiced;
                 });
                 return mixed.length === 1 ? mixed[0] : mixed;
               },
             },
-      tags: { title: cut.title },
+      ...(bedTrack ? { composable: true } : { tags: { title: cut.title } }),
     });
     if (!conversion.isValid || conversion.discardedTracks.length) {
       throw Error(
@@ -428,11 +482,22 @@ export async function exportWeb(
     }
     signal.throwIfAborted();
     cancel = () => {
-      void conversion.cancel();
+      void conversion.cancel().catch(() => {});
+      if (bedTrack) void output.cancel().catch(() => {});
     };
     signal.addEventListener('abort', cancel, { once: true });
     conversion.onProgress = progress;
-    await conversion.execute();
+    if (bedTrack && mix) {
+      await output.start();
+      await Promise.all([
+        conversion.execute(),
+        writeSoundtrack(AudioSample, bedTrack, mix, length, signal),
+      ]);
+      signal.throwIfAborted();
+      await output.finalize();
+    } else {
+      await conversion.execute();
+    }
     const buffer = output.target.buffer;
     if (!buffer?.byteLength) throw Error('The encoder produced an empty clip.');
     const name = `${cut.title.replace(/[^\p{L}\p{N} -]/gu, '_')}.webm`;
@@ -443,6 +508,9 @@ export async function exportWeb(
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 30000);
     return name;
+  } catch (error) {
+    cancel?.();
+    throw error;
   } finally {
     mark?.close();
     if (cancel) signal.removeEventListener('abort', cancel);

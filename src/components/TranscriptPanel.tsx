@@ -1,5 +1,6 @@
 import { memo, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import { Check, Download, Pencil, Search } from 'lucide-react';
+import { Select } from './Select';
 import {
   TRANSLATE_LANGUAGES,
   readingLines,
@@ -22,17 +23,19 @@ function SpokenLanguage({
 }) {
   return (
     <div className="spoken-row">
-      <label>
-        Spoken language
-        <select value={value} onChange={(e) => onChange(e.target.value)}>
-          <option value="auto">Detect</option>
-          {TRANSLATE_LANGUAGES.map((item) => (
-            <option key={item.code} value={item.code}>
-              {item.name}
-            </option>
-          ))}
-        </select>
-      </label>
+      <div className="spoken-field">
+        <span aria-hidden="true">Spoken language</span>
+        <Select
+          className="select-field"
+          label="Spoken language"
+          value={value}
+          onChange={onChange}
+          options={[
+            { value: 'auto', label: 'Detect' },
+            ...TRANSLATE_LANGUAGES.map((item) => ({ value: item.code, label: item.name })),
+          ]}
+        />
+      </div>
       {again && (
         <button type="button" className="text-btn" onClick={again}>
           Transcribe again

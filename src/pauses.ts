@@ -234,8 +234,9 @@ export async function scanCut(project: Project, cut: Cut, signal: AbortSignal) {
 export async function hearPauses(blob: Blob, start: number, end: number, signal: AbortSignal) {
   const duration = end - start;
   if (!(duration > 0)) return emptyPlan(0);
-  const { Input, BlobSource, MP4, QTFF, MATROSKA, AudioSampleSink } = await import('mediabunny');
-  const input = new Input({ source: new BlobSource(blob), formats: [MP4, QTFF, MATROSKA] });
+  const { Input, BlobSource, MP4, QTFF, MATROSKA, WEBM, AudioSampleSink } =
+    await import('mediabunny');
+  const input = new Input({ source: new BlobSource(blob), formats: [MP4, QTFF, MATROSKA, WEBM] });
   try {
     if (signal.aborted) throw cancelled();
     const track = await input.getPrimaryAudioTrack();

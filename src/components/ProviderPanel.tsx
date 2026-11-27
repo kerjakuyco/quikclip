@@ -1,7 +1,15 @@
 import { useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Check, Cloud, HardDrive, LoaderCircle, Plug, RefreshCw, Sparkles } from 'lucide-react';
+import { Select } from './Select';
 import { desktop, errorText, readSaved } from '../studio';
+import {
+  HIGHLIGHT_COUNTS,
+  HIGHLIGHT_LENGTHS,
+  loadHighlightOptions,
+  rememberHighlightOptions,
+  type HighlightOptions,
+} from '../highlights';
 
 const providers = {
   ollama: {
@@ -96,7 +104,7 @@ export function ProviderPanel({
   analyze,
 }: {
   busy: boolean;
-  analyze: (connection: Connection, model: string) => Promise<void>;
+  analyze: (connection: Connection, model: string, options: HighlightOptions) => Promise<void>;
 }) {
   const [settings, setSettings] = useState<Settings>(() => readSaved(storageKey, initial));
   const provider = settings.active,
@@ -104,10 +112,16 @@ export function ProviderPanel({
     profile = settings.profiles[provider];
   const [form, setForm] = useState<Connection>(() => profile?.connection ?? defaults(provider));
   const [expanded, setExpanded] = useState(!profile);
+  const [options, setOptions] = useState(loadHighlightOptions);
   const [key, setKey] = useState(''),
     [working, setWorking] = useState(false),
     [problem, setProblem] = useState('');
   const disabled = busy || working || !desktop;
+  function configure(patch: Partial<HighlightOptions>) {
+    const next = { ...options, ...patch };
+    setOptions(next);
+    rememberHighlightOptions(next);
+  }
   function store(next: Settings) {
     setSettings(next);
     try {
@@ -171,7 +185,7 @@ export function ProviderPanel({
         return;
       }
     }
-    await analyze(connection, model);
+    await analyze(connection, model, options);
   }
   async function forget() {
     if (!profile) return;
@@ -327,29 +341,28 @@ export function ProviderPanel({
                 Edit connection
               </button>
             </div>
-            <label className="field-label">
-              Vision model
-              <select
+            <div className="field-label">
+              <span aria-hidden="true">Vision model</span>
+              <Select
+                className="select-field"
+                label="Vision model"
                 disabled={disabled}
                 value={profile.custom ? '__custom' : profile.model}
-                onChange={(e) => {
-                  const custom = e.target.value === '__custom';
-                  changeProfile({ ...profile, custom, model: custom ? '' : e.target.value });
+                onChange={(next) => {
+                  const custom = next === '__custom';
+                  changeProfile({ ...profile, custom, model: custom ? '' : next });
                 }}
-              >
-                {!profile.models.length && provider !== 'cloudflare' && (
-                  <option value="">No vision models installed</option>
-                )}
-                {profile.models.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.name}
-                  </option>
-                ))}
-                {provider === 'cloudflare' && (
-                  <option value="__custom">Other gateway model…</option>
-                )}
-              </select>
-            </label>
+                options={[
+                  ...(!profile.models.length && provider !== 'cloudflare'
+                    ? [{ value: '', label: 'No vision models installed' }]
+                    : []),
+                  ...profile.models.map((m) => ({ value: m.id, label: m.name })),
+                  ...(provider === 'cloudflare'
+                    ? [{ value: '__custom', label: 'Other gateway model…' }]
+                    : []),
+                ]}
+              />
+            </div>
             {profile.custom && (
               <label className="field-label">
                 Gateway model ID
@@ -373,10 +386,57 @@ export function ProviderPanel({
                 Forget connection
               </button>
             </div>
+            <div className="highlight-options">
+              <div>
+                <span className="field-label" id="highlight-count-label">
+                  Maximum highlights
+                </span>
+                <div
+                  className="format-options highlight-count"
+                  role="group"
+                  aria-labelledby="highlight-count-label"
+                >
+                  {HIGHLIGHT_COUNTS.map((count) => (
+                    <button
+                      key={count}
+                      type="button"
+                      disabled={disabled}
+                      className={options.count === count ? 'active' : ''}
+                      aria-pressed={options.count === count}
+                      onClick={() => configure({ count })}
+                    >
+                      {count}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <span className="field-label" id="highlight-length-label">
+                  Maximum clip length
+                </span>
+                <div
+                  className="format-options highlight-length"
+                  role="group"
+                  aria-labelledby="highlight-length-label"
+                >
+                  {HIGHLIGHT_LENGTHS.map((maxSeconds) => (
+                    <button
+                      key={maxSeconds}
+                      type="button"
+                      disabled={disabled}
+                      className={options.maxSeconds === maxSeconds ? 'active' : ''}
+                      aria-pressed={options.maxSeconds === maxSeconds}
+                      onClick={() => configure({ maxSeconds })}
+                    >
+                      {maxSeconds} s
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
             <p className="subnote">
-              {meta.cloud
-                ? `Analysis sends a nine-frame contact sheet and timestamps to ${meta.label}. Your original video stays on this device.`
-                : `Analysis sends sampled frames to your ${meta.label} server on port ${profile.connection.port}.`}
+              Analysis sends the transcript when available, otherwise nine sampled frames and
+              timestamps, to {meta.label}. Your original video stays on this device.
             </p>
             {!profile.model && (
               <p className="subnote">

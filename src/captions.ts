@@ -663,6 +663,57 @@ export function editCue(
   return { ...captions, words: own, from: start, to: end };
 }
 
+const MIN_WORD_GAP = 0.04;
+
+function clipRangeWords(words: TimedText[], start: number, end: number) {
+  const middle = (word: TimedText) => (word.start + word.end) / 2;
+  return words.filter((word) => middle(word) >= start && middle(word) <= end);
+}
+
+/**
+ * Move one word's edge on this clip's own lines. `index` is into those lines, on the source clock.
+ * Words stay in order, at least 0.04 s long, and inside the clip. The first move copies the transcript's
+ * words onto the clip.
+ */
+export function retimeWord(
+  captions: CutCaptions,
+  source: TimedText[],
+  clipStart: number,
+  clipEnd: number,
+  index: number,
+  edge: 'start' | 'end',
+  at: number,
+): CutCaptions | null {
+  const owned = (captions.words ?? clipRangeWords(source, clipStart, clipEnd)).map((word) => ({
+    ...word,
+  }));
+  const word = owned[index];
+  if (!word || !(clipEnd > clipStart) || !Number.isFinite(at)) return null;
+  const limit = (value: number, min: number, max: number) =>
+    Math.round(Math.max(min, Math.min(max, value)) * 1000) / 1000;
+  if (edge === 'start') {
+    const prev = index > 0 ? owned[index - 1].end : clipStart;
+    const start = limit(at, prev, word.end - MIN_WORD_GAP);
+    if (start === word.start) return null;
+    word.start = start;
+  } else {
+    const next = index < owned.length - 1 ? owned[index + 1].start : clipEnd;
+    const end = limit(at, word.start + MIN_WORD_GAP, next);
+    if (end === word.end) return null;
+    word.end = end;
+  }
+  return { ...captions, words: owned, from: clipStart, to: clipEnd };
+}
+
+/** Which of the clip's words a cue word is, matched by its source start. */
+export function wordIndex(words: TimedText[], sourceStart: number, text: string) {
+  const exact = words.findIndex(
+    (word) => Math.abs(word.start - sourceStart) < 0.05 && word.text === text,
+  );
+  if (exact >= 0) return exact;
+  return words.findIndex((word) => Math.abs(word.start - sourceStart) < 0.05);
+}
+
 /** The clip's own lines dropped: its captions come from the transcript again. */
 export function transcriptLines(captions: CutCaptions): CutCaptions {
   return {

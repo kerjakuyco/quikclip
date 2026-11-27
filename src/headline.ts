@@ -1,5 +1,3 @@
-import type { Shape } from './studio';
-
 /** ClipCheap's headline box (clip-ai `HEADLINE_*`): bold white lines on a dark box at the top of the frame. */
 export const HEADLINE_MAX = 80;
 const SPEC = {
@@ -8,27 +6,19 @@ const SPEC = {
   wide: { top: 0.06, size: 46, columns: 48 },
 } as const;
 
-export type HeadlineSpec = { top: number; size: number; columns: number; fontSize: number };
-
 export function headlineText(value: string | undefined) {
   return (value ?? '').trim().slice(0, HEADLINE_MAX);
 }
 
-function aspect(shape: Shape, width: number, height: number) {
-  if (shape === 'vertical' || (shape === 'source' && height > width)) return 'vertical' as const;
-  if (shape === 'square' || (shape === 'source' && width === height)) return 'square' as const;
-  return 'wide' as const;
-}
-
-/** Placement for an output frame. `fontSize` is in pixels at `outShort`, the frame's short side. */
-export function headlineSpec(
-  shape: Shape,
-  width: number,
-  height: number,
-  outShort: number,
-): HeadlineSpec {
-  const spec = SPEC[aspect(shape, width, height)];
-  return { ...spec, fontSize: Math.max(12, Math.round((spec.size * outShort) / 1080)) };
+/** Placement in the actual output frame, not the source dimensions. */
+export function headlineSpec(width: number, height: number) {
+  const { top, size, columns } =
+    SPEC[width < height ? 'vertical' : width === height ? 'square' : 'wide'];
+  return {
+    top,
+    columns,
+    fontSize: Math.max(12, Math.round((size * Math.min(width, height)) / 1080)),
+  };
 }
 
 /** Greedy wrap at the column count clip-ai uses for this frame. */
@@ -48,15 +38,10 @@ export function headlineLines(text: string, columns: number) {
 }
 
 /** The headline box's bottom edge in pixels of the frame (paintHeadline's geometry), or null without a headline. */
-export function headlineBottom(
-  shape: Shape,
-  width: number,
-  height: number,
-  text: string | undefined,
-) {
+export function headlineBottom(width: number, height: number, text: string | undefined) {
   const clean = headlineText(text);
   if (!clean) return null;
-  const spec = headlineSpec(shape, width, height, Math.min(width, height));
+  const spec = headlineSpec(width, height);
   const lines = headlineLines(clean, spec.columns);
   const pad = Math.max(1, Math.round(spec.fontSize * 0.3));
   return Math.round(height * spec.top) + lines.length * spec.fontSize * 1.36 + pad * 2;
@@ -65,16 +50,10 @@ export function headlineBottom(
 type DrawCtx = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
 
 /** Draws the headline in Manrope, the face the studio already loads. Returns nothing when the text is empty. */
-export function paintHeadline(
-  ctx: DrawCtx,
-  shape: Shape,
-  width: number,
-  height: number,
-  text: string,
-) {
+export function paintHeadline(ctx: DrawCtx, width: number, height: number, text: string) {
   const clean = headlineText(text);
   if (!clean) return;
-  const spec = headlineSpec(shape, width, height, Math.min(width, height));
+  const spec = headlineSpec(width, height);
   const lines = headlineLines(clean, spec.columns);
   const font = `800 ${spec.fontSize}px "Manrope Variable", sans-serif`;
   ctx.font = font;
@@ -98,16 +77,16 @@ export function paintHeadline(
 }
 
 /** A transparent PNG of the headline, or null. The desktop export overlays this on the frame. */
-export async function headlinePng(shape: Shape, width: number, height: number, text: string) {
+export async function headlinePng(width: number, height: number, text: string) {
   if (!headlineText(text)) return null;
-  const spec = headlineSpec(shape, width, height, Math.min(width, height));
+  const spec = headlineSpec(width, height);
   await document.fonts.load(`800 ${spec.fontSize}px "Manrope Variable"`);
   const canvas = document.createElement('canvas');
   canvas.width = width;
   canvas.height = height;
   const ctx = canvas.getContext('2d');
   if (!ctx) throw Error('This browser cannot draw the headline.');
-  paintHeadline(ctx, shape, width, height, text);
+  paintHeadline(ctx, width, height, text);
   const url = canvas.toDataURL('image/png');
   return url.slice(url.indexOf(',') + 1);
 }

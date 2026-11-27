@@ -20,24 +20,28 @@ export type MusicSettings = {
   fade_out?: number;
   loop?: boolean;
   start?: number;
+  /** Dip under speech on export (media.rs music_graph). Absent stays level, as older clips were mixed. */
+  duck?: boolean;
 };
+export type MusicMix = Required<MusicSettings>;
 
 const share = (value: number | undefined, fallback: number) =>
   typeof value === 'number' && Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : fallback;
 const seconds = (value: number | undefined, fallback: number) =>
   typeof value === 'number' && Number.isFinite(value) ? Math.min(5, Math.max(0, value)) : fallback;
 
-function settingsOf(music: MusicSettings) {
+export function musicMix(music: MusicSettings, duration: number): MusicMix {
+  // Leave at least one audible sample even on a tiny file or a track rounded in metadata.
+  const last = Math.max(0, duration - Math.min(0.05, duration / 2));
+  const start = typeof music.start === 'number' && Number.isFinite(music.start) ? music.start : 0;
   return {
     volume: share(music.volume, MUSIC_DEFAULTS.volume),
     source_volume: share(music.source_volume, MUSIC_DEFAULTS.source_volume),
     fade_in: seconds(music.fade_in, MUSIC_DEFAULTS.fade_in),
     fade_out: seconds(music.fade_out, MUSIC_DEFAULTS.fade_out),
-    loop: music.loop ?? MUSIC_DEFAULTS.loop,
-    start: Math.max(
-      0,
-      typeof music.start === 'number' && Number.isFinite(music.start) ? music.start : 0,
-    ),
+    loop: typeof music.loop === 'boolean' ? music.loop : MUSIC_DEFAULTS.loop,
+    start: Math.max(0, Math.min(last, start)),
+    duck: music.duck === true,
   };
 }
 
@@ -51,11 +55,10 @@ export function musicVolume(music: MusicSettings) {
  */
 export function musicBed(
   time: number,
-  music: MusicSettings,
+  settings: MusicMix,
   trackDuration: number,
   length: number,
 ): { position: number | null; volume: number } {
-  const settings = settingsOf(music);
   if (time < 0 || time > length || trackDuration <= 0) return { position: null, volume: 0 };
   let position = settings.start + time;
   if (position >= trackDuration) {
@@ -72,7 +75,7 @@ export function musicBed(
 
 /** Preview position, rounded to a millisecond the way the ClipCheap studio seeks the track. */
 export function musicAt(time: number, music: MusicSettings, trackDuration: number, length: number) {
-  const state = musicBed(time, music, trackDuration, length);
+  const state = musicBed(time, musicMix(music, trackDuration), trackDuration, length);
   if (state.position === null) return state;
   return { position: Math.round(state.position * 1000) / 1000, volume: state.volume };
 }

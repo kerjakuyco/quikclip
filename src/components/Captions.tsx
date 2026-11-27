@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react';
-import { Check, Languages, LoaderCircle, RotateCcw } from 'lucide-react';
+import { Check, Languages, LoaderCircle, Pencil, RotateCcw } from 'lucide-react';
+import { Select } from './Select';
 import {
   CAPTION_COLORS,
   CAPTION_POSITIONS,
@@ -246,12 +247,15 @@ function CueLine({
   );
 }
 
-function Swatches({
+export function Swatches({
   label,
+  group,
   value,
   onChange,
 }: {
   label: string;
+  /** The group's accessible name, when it isn't the caption's. */
+  group?: string;
   value: string;
   onChange: (color: string) => void;
 }) {
@@ -265,7 +269,7 @@ function Swatches({
       <div
         className="caption-swatches"
         role="radiogroup"
-        aria-label={`Caption ${label.toLowerCase()}`}
+        aria-label={group ?? `Caption ${label.toLowerCase()}`}
       >
         {CAPTION_COLORS.map((color, index) => (
           <button
@@ -356,12 +360,15 @@ export function CaptionFields({
     translated?.language ?? (spoken === 'es' ? 'en' : 'es'),
   );
   const [showBoth, setShowBoth] = useState(translated?.both ?? false);
+  const [editingLines, setEditingLines] = useState(false);
+  useEffect(() => setEditingLines(false), [cut.id]);
   useEffect(() => {
     if (!translated) return;
     setChoice(translated.language);
     setShowBoth(translated.both);
   }, [translated?.language, translated?.both]);
   const both = translated ? translated.both : showBoth;
+  const showLines = editingLines || own || Boolean(translated);
   const missing = translated
     ? cues.filter((cue) => !translationAt(translated.lines, cut.start + cue.start)).length
     : 0;
@@ -438,18 +445,17 @@ export function CaptionFields({
               )}
             </div>
             <div className="translate-row">
-              <select
-                aria-label="Translate into"
+              <Select
+                className="select-field"
+                label="Translate into"
                 value={choice}
                 disabled={translating}
-                onChange={(e) => setChoice(e.target.value)}
-              >
-                {TRANSLATE_LANGUAGES.map((item) => (
-                  <option key={item.code} value={item.code}>
-                    {item.name}
-                  </option>
-                ))}
-              </select>
+                onChange={setChoice}
+                options={TRANSLATE_LANGUAGES.map((item) => ({
+                  value: item.code,
+                  label: item.name,
+                }))}
+              />
               <button
                 type="button"
                 className="translate-go"
@@ -495,50 +501,68 @@ export function CaptionFields({
         </>
       )}
       {cues.length ? (
-        <>
-          <span className="field-label">Caption lines</span>
-          <ol className="cue-list" aria-label="Caption lines">
-            {cues.map((cue, index) => {
-              const at = cut.start + cue.start;
-              const replacing = Boolean(translated && !translated.both);
-              return (
-                <CueLine
-                  key={`${cut.id}-${index}-${cue.start}`}
-                  cue={cue}
-                  index={index}
-                  translation={both && translated ? (cue.translation ?? '') : undefined}
-                  commit={(text) =>
-                    update({
-                      captions: replacing
-                        ? writeTranslationLine(captions, at, text)
-                        : editCue(captions, words, cue, text, cut.start, cut.end),
-                    })
-                  }
-                  commitTranslation={(text) =>
-                    update({ captions: writeTranslationLine(captions, at, text) })
-                  }
-                />
-              );
-            })}
-          </ol>
-          <p className="fit-note">
-            {desktop && captions.style !== 'none' && 'Export also saves an .srt file. '}
-            {own && 'These edits apply only to this clip. '}
-            <button type="button" className="link-btn" onClick={openTranscript}>
-              Open the transcript
-            </button>{' '}
-            to correct words across all clips.
-          </p>
-          {own && (
-            <button
-              type="button"
-              className="text-btn caption-redo"
-              onClick={() => update({ captions: transcriptLines(captions) })}
-            >
-              <RotateCcw size={12} /> Reset to transcript
+        showLines ? (
+          <>
+            <span className="field-label">Caption lines</span>
+            <ol className="cue-list" aria-label="Caption lines">
+              {cues.map((cue, index) => {
+                const at = cut.start + cue.start;
+                const replacing = Boolean(translated && !translated.both);
+                return (
+                  <CueLine
+                    key={`${cut.id}-${index}-${cue.start}`}
+                    cue={cue}
+                    index={index}
+                    translation={both && translated ? (cue.translation ?? '') : undefined}
+                    commit={(text) =>
+                      update({
+                        captions: replacing
+                          ? writeTranslationLine(captions, at, text)
+                          : editCue(captions, words, cue, text, cut.start, cut.end),
+                      })
+                    }
+                    commitTranslation={(text) =>
+                      update({ captions: writeTranslationLine(captions, at, text) })
+                    }
+                  />
+                );
+              })}
+            </ol>
+            <p className="fit-note">
+              {desktop && captions.style !== 'none' && 'Export also saves an .srt file. '}
+              {own && 'These edits apply only to this clip. '}
+              <button type="button" className="link-btn" onClick={openTranscript}>
+                Open the transcript
+              </button>{' '}
+              to correct words across all clips.
+            </p>
+            {own && (
+              <button
+                type="button"
+                className="text-btn caption-redo"
+                onClick={() => {
+                  setEditingLines(false);
+                  update({ captions: transcriptLines(captions) });
+                }}
+              >
+                <RotateCcw size={12} /> Reset to transcript
+              </button>
+            )}
+          </>
+        ) : (
+          <div className="caption-source">
+            <p className="fit-note">
+              These lines come from the transcript.{' '}
+              <button type="button" className="link-btn" onClick={openTranscript}>
+                Open the transcript
+              </button>{' '}
+              to correct a word for every clip.
+            </p>
+            <button type="button" className="text-btn" onClick={() => setEditingLines(true)}>
+              <Pencil size={12} /> Edit this clip's lines
             </button>
-          )}
-        </>
+          </div>
+        )
       ) : waiting ? (
         <p className="fit-note" role="status">
           {waiting}

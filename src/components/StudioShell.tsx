@@ -3,7 +3,6 @@ import { getCurrentWindow, type Window as TauriWindow } from '@tauri-apps/api/wi
 import {
   ArrowDownToLine,
   Check,
-  ChevronRight,
   CircleAlert,
   CircleHelp,
   Clapperboard,
@@ -11,7 +10,10 @@ import {
   Keyboard,
   Layers3,
   Plus,
+  Redo2,
+  Search,
   Trash2,
+  Undo2,
 } from 'lucide-react';
 import mark from '../assets/quikclip-mark.svg';
 import { desktop, frame, type Project } from '../studio';
@@ -54,7 +56,9 @@ export function StudioShell({
   onDelete,
   onImport,
   onExport,
+  history,
   onShortcuts,
+  onCommands,
   onGuide,
   notice,
   children,
@@ -69,7 +73,11 @@ export function StudioShell({
   onDelete: (p: Project) => void;
   onImport: () => void;
   onExport: () => void;
+  /** Undo and redo for the open project's edits (history.ts). */
+  history: { canUndo: boolean; canRedo: boolean; undo: () => void; redo: () => void };
   onShortcuts: () => void;
+  /** Opens the command palette (Ctrl+K). */
+  onCommands: () => void;
   onGuide: () => void;
   notice: (message: string) => void;
   children: ReactNode;
@@ -95,26 +103,50 @@ export function StudioShell({
           <strong>Quikclip</strong>
           <span>Studio</span>
         </div>
-        <div className="breadcrumbs" aria-hidden="true">
-          <span>Workspace</span>
-          <ChevronRight size={13} />
-          <b>{page}</b>
+        <div className="top-search">
+          <button
+            type="button"
+            className="command-trigger"
+            aria-label="Command palette"
+            title="Every action, by typing (Ctrl+K)"
+            onClick={onCommands}
+          >
+            <Search size={14} aria-hidden="true" />
+            <span>Search clips, looks and actions</span>
+            <kbd>Ctrl K</kbd>
+          </button>
         </div>
         <div className="top-actions">
-          <span
-            className={`save-status${saved ? '' : ' unsaved'}`}
-            title={saved ? 'Saved on this device' : 'Storage full. Changes are not saved.'}
-            role="status"
-          >
-            {saved ? <Check size={14} /> : <CircleAlert size={14} />}
-            <span>{saved ? 'Saved locally' : 'Storage full · unsaved'}</span>
-          </span>
           <button className="btn secondary" aria-label="Import media" onClick={onImport}>
             <Plus size={16} />
             <span>
               Import<span className="action-detail"> media</span>
             </span>
           </button>
+          {page === 'Clip editor' && (
+            <span className="history-actions" role="group" aria-label="Edit history">
+              <button
+                type="button"
+                className="icon-btn"
+                aria-label="Undo"
+                title="Undo (Ctrl+Z)"
+                disabled={!history.canUndo || busy}
+                onClick={history.undo}
+              >
+                <Undo2 size={16} />
+              </button>
+              <button
+                type="button"
+                className="icon-btn"
+                aria-label="Redo"
+                title="Redo (Ctrl+Shift+Z)"
+                disabled={!history.canRedo || busy}
+                onClick={history.redo}
+              >
+                <Redo2 size={16} />
+              </button>
+            </span>
+          )}
           {page === 'Clip editor' && (
             <button className="btn primary" aria-label="Export clip" onClick={onExport}>
               <ArrowDownToLine size={16} />
@@ -212,8 +244,18 @@ export function StudioShell({
         {children}
       </main>
       <footer className="statusbar">
-        <span className="status-location">
-          <i aria-hidden="true" /> Local workspace
+        <span className="status-start">
+          <span className="status-location">
+            <i aria-hidden="true" /> Local workspace
+          </span>
+          <span
+            className={`save-status${saved ? '' : ' unsaved'}`}
+            title={saved ? 'Saved on this device' : 'Storage full. Changes are not saved.'}
+            role="status"
+          >
+            {saved ? <Check size={13} /> : <CircleAlert size={13} />}
+            <span>{saved ? 'Saved locally' : 'Storage full · unsaved'}</span>
+          </span>
         </span>
         {page === 'Clip editor' && (
           <span className="work-hint">
