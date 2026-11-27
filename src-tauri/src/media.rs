@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 use tauri_plugin_dialog::DialogExt;
 use tokio::{
     fs,
@@ -130,9 +130,22 @@ async fn run_lines(
     tool: &str,
     args: &[&str],
     seconds: u64,
+    line: impl FnMut(&str) + Send,
+) -> Result<()> {
+    run_lines_in(None, tool, args, seconds, line).await
+}
+
+async fn run_lines_in(
+    cwd: Option<&Path>,
+    tool: &str,
+    args: &[&str],
+    seconds: u64,
     mut line: impl FnMut(&str) + Send,
 ) -> Result<()> {
     let mut command = Command::new(tool_path(tool)?);
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
     command
         .args(args)
         .kill_on_drop(true)
@@ -621,14 +634,132 @@ async fn hardware_encoder() -> Option<&'static ImportEncoder> {
         .await
 }
 
+/// Finished exports: x264 at a visually lossless quality, the fallback for every export.
+const SOFTWARE_EXPORT: &[&str] = &["-c:v", "libx264", "-crf", "18", "-preset", "fast"];
+
+/// The graphics card's H.264 encoder at an export's quality, for an encoder that opened at import.
+fn hardware_export(codec: &str) -> Option<&'static [&'static str]> {
+    Some(match codec {
+        "h264_nvenc" => &[
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            "p5",
+            "-tune",
+            "hq",
+            "-rc",
+            "vbr",
+            "-cq",
+            "19",
+            "-b:v",
+            "0",
+        ],
+        "h264_amf" => &[
+            "-c:v",
+            "h264_amf",
+            "-usage",
+            "transcoding",
+            "-quality",
+            "balanced",
+            "-rc",
+            "cqp",
+            "-qp_i",
+            "18",
+            "-qp_p",
+            "18",
+            "-profile",
+            "high",
+        ],
+        "h264_qsv" => &[
+            "-c:v",
+            "h264_qsv",
+            "-preset",
+            "medium",
+            "-global_quality",
+            "18",
+        ],
+        "h264_videotoolbox" => &["-c:v", "h264_videotoolbox", "-q:v", "65"],
+        _ => return None,
+    })
+}
+
+/// Whether exports may use the graphics card (the studio's export setting). On unless turned off.
+static GPU_EXPORTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_gpu_exports(on: bool) {
+    GPU_EXPORTS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The encoders an export tries, in order: the graphics card's when allowed and one works here, then x264.
+pub(crate) async fn video_encoders() -> Vec<&'static [&'static str]> {
+    let mut list = Vec::new();
+    if GPU_EXPORTS.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Some(args) = hardware_encoder()
+            .await
+            .and_then(|encoder| hardware_export(encoder.codec))
+        {
+            list.push(args);
+        }
+    }
+    list.push(SOFTWARE_EXPORT);
+    list
+}
+
+tokio::task_local! {
+    /// How far a queued render is, 0 to 1 (jobs.rs render commands): encodes report to it while it is set.
+    pub static RENDER_PROGRESS: std::sync::Arc<dyn Fn(f64) + Send + Sync>;
+}
+
+/// Runs an encode with each video encoder in turn until one finishes: `before` and `after` go either side of the
+/// encoder's arguments. A graphics card that turns out unable to encode this file falls back to x264. Inside a queued
+/// render, how far it is (of `length` seconds of output) is reported as it goes.
+pub(crate) async fn encode_with(
+    cwd: Option<&Path>,
+    encoders: &[&[&str]],
+    before: &[&str],
+    after: &[&str],
+    length: f64,
+) -> Result<()> {
+    let report = RENDER_PROGRESS.try_with(|report| report.clone()).ok();
+    let mut last = Err("No video encoder is available.".to_string());
+    for (index, encoder) in encoders.iter().enumerate() {
+        let mut args: Vec<&str> = before.to_vec();
+        args.extend_from_slice(encoder);
+        args.extend_from_slice(after);
+        last = match &report {
+            Some(report) if length > 0.0 => {
+                let mut with = vec!["-progress", "pipe:1", "-nostats"];
+                with.extend_from_slice(&args);
+                let mut state = progress::Encode::default();
+                run_lines_in(cwd, "ffmpeg", &with, 7200, |line| {
+                    if let Some((done, _)) = state.line(line) {
+                        report((done / length).clamp(0.0, 1.0));
+                    }
+                })
+                .await
+            }
+            _ => run_in(cwd, "ffmpeg", &args, 7200).await.map(|_| ()),
+        };
+        match &last {
+            Ok(()) => return Ok(()),
+            Err(error) if index + 1 < encoders.len() => {
+                eprintln!(
+                    "[export] {} failed, trying the next encoder: {error}",
+                    encoder[1]
+                );
+            }
+            Err(_) => {}
+        }
+    }
+    last
+}
+
 /// The stages of a local import. A link import downloads first.
 const IMPORT_STEPS: [&str; 2] = ["Editing copy", "Preview frames"];
 
 fn tracker(app: &AppHandle, steps: Vec<&'static str>) -> Tracker<'static> {
     let app = app.clone();
-    Tracker::new(steps, move |step| {
-        let _ = app.emit("studio-step", step);
-    })
+    Tracker::new(steps, move |step| crate::jobs::show_step(&app, step))
 }
 
 async fn ingest(
@@ -1285,6 +1416,79 @@ fn split_filter(face: &str, frame_w: u32, frame_h: u32) -> String {
     format!(
         "split[facesrc][mainsrc];[facesrc]{face}[face];[mainsrc]split[bgsrc][fgsrc];[bgsrc]scale={small_w}:{small_h}:force_original_aspect_ratio=increase,crop={small_w}:{small_h},boxblur={radius}:2,scale={frame_w}:{bottom},eq=brightness=-0.18[bg];[fgsrc]scale={frame_w}:{bottom}:force_original_aspect_ratio=decrease:flags=lanczos[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2[main];[face][main]vstack,setsar=1"
     )
+}
+
+/// The facecam box of the stacked layout, as shares of the source picture (src/facecam.ts).
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+pub struct CamBox {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+const STACK_SHAPE: &str = "The facecam layout is for vertical frames.";
+
+/// The stacked layout for streams: the facecam box (`cam`) filling the top band, as tall as
+/// the split layout's face band, and the gameplay filling the rest, cut from the source in that
+/// part's shape at the saved crop position.
+pub fn stack_filter(
+    shape: &str,
+    width: u64,
+    height: u64,
+    crop: CropPosition,
+    cam: CamBox,
+) -> Result<String> {
+    if shape == "source" {
+        return Err(STACK_SHAPE.into());
+    }
+    let (frame_w, frame_h) = frame_size(shape, width, height)?;
+    if frame_h <= frame_w {
+        return Err(STACK_SHAPE.into());
+    }
+    if crop.x > 100 || crop.y > 100 {
+        return Err("Crop position must be between 0% and 100%.".into());
+    }
+    let finite = [cam.x, cam.y, cam.w, cam.h].iter().all(|n| n.is_finite());
+    if !finite
+        || cam.w < 0.02
+        || cam.h < 0.02
+        || cam.x < 0.0
+        || cam.y < 0.0
+        || cam.x + cam.w > 1.001
+        || cam.y + cam.h > 1.001
+    {
+        return Err("The facecam box must be inside the video.".into());
+    }
+    let (iw, ih) = (width as f64, height as f64);
+    let cw = trunc_even(cam.w * iw).max(16).min(trunc_even(iw));
+    let ch = trunc_even(cam.h * ih).max(16).min(trunc_even(ih));
+    let cx = trunc_even(cam.x * iw).min(width as u32 - cw);
+    let cy = trunc_even(cam.y * ih).min(height as u32 - ch);
+    let top = split_band(frame_h);
+    let bottom = frame_h - top;
+    // The largest part of the source in the gameplay band's shape.
+    let (gw, gh) = if iw * f64::from(bottom) > ih * f64::from(frame_w) {
+        (
+            trunc_even(ih * f64::from(frame_w) / f64::from(bottom)),
+            trunc_even(ih),
+        )
+    } else {
+        (
+            trunc_even(iw),
+            trunc_even(iw * f64::from(bottom) / f64::from(frame_w)),
+        )
+    };
+    let offset = |source: u64, size: u32, position: u8| {
+        source
+            .saturating_sub(u64::from(size))
+            .saturating_mul(u64::from(position))
+            / 200
+            * 2
+    };
+    let (gx, gy) = (offset(width, gw, crop.x), offset(height, gh, crop.y));
+    Ok(format!(
+        "split[camsrc][gamesrc];[camsrc]crop={cw}:{ch}:{cx}:{cy},scale={frame_w}:{top}:force_original_aspect_ratio=increase:flags=lanczos,crop={frame_w}:{top}[cam];[gamesrc]crop={gw}:{gh}:{gx}:{gy},scale={frame_w}:{bottom}:flags=lanczos[game];[cam][game]vstack,setsar=1"
+    ))
 }
 
 /// `fill` crops to the saved position. `blur` is clip-ai `render_filters` with `fit == "blur"`:
@@ -2465,6 +2669,9 @@ pub struct ExportRequest {
     /// Text on the video (texts.rs).
     #[serde(default)]
     pub texts: Vec<crate::texts::TextRequest>,
+    /// The facecam box, for the stacked layout (`fit` "stack").
+    #[serde(default)]
+    pub cam: Option<CamBox>,
 }
 
 /// B-roll (ClipCheap's b-roll layer): `length` seconds of a project video from `from`, shown `at` seconds after the
@@ -2588,6 +2795,12 @@ pub(crate) struct PreparedExport {
     motion: bool,
 }
 
+impl ExportSource {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 impl PreparedExport {
     pub(crate) fn title(&self) -> &str {
         &self.request.title
@@ -2601,7 +2814,17 @@ impl PreparedExport {
         let follow = request.shape != "source"
             && (request.fit.is_empty() || request.fit == "fill" || request.fit == "split")
             && request.camera.len() >= 2;
-        let filter = if follow {
+        let filter = if request.fit == "stack" {
+            stack_filter(
+                &request.shape,
+                input.width,
+                input.height,
+                request.crop,
+                request
+                    .cam
+                    .ok_or("The facecam layout needs its camera box.")?,
+            )?
+        } else if follow {
             moving_crop(
                 &request.shape,
                 &request.fit,
@@ -2693,6 +2916,38 @@ pub async fn export_clip(
         return Err(warning);
     }
     Ok(Some(rendered.path))
+}
+
+/// A render's file: an .mp4, outside the library, and not the source itself.
+pub(crate) fn check_target(app: &AppHandle, target: &Path, source: &Path) -> Result<()> {
+    if !target
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"))
+    {
+        return Err("Choose a filename ending in .mp4.".into());
+    }
+    if target.starts_with(root(app)?) || target == source {
+        return Err("Choose a destination outside your source library.".into());
+    }
+    Ok(())
+}
+
+/// One clip rendered to a file chosen when it was queued.
+pub async fn render_clip_to(
+    app: &AppHandle,
+    id: &str,
+    request: ExportRequest,
+    target: &Path,
+) -> Result<String> {
+    let key = request.video.clone().unwrap_or_else(|| id.to_string());
+    let input = export_source(app, &key).await?;
+    let prepared = PreparedExport::new(request, &input)?;
+    check_target(app, target, &input.path)?;
+    let rendered = render_prepared(app, &input, target, &prepared).await?;
+    match rendered.warning {
+        Some(warning) => Err(warning),
+        None => Ok(rendered.path),
+    }
 }
 
 /// The clip's b-roll on the exported clock, each shot checked against its own video.
@@ -2938,29 +3193,54 @@ fn batch_folder(parent: &Path) -> Result<PathBuf> {
         .map_err(|e| format!("Could not create the export folder: {e}"))
 }
 
-pub async fn export_batch(
-    app: AppHandle,
-    id: String,
+type BatchItems = (
+    std::collections::HashMap<String, ExportSource>,
+    Vec<(String, PreparedExport)>,
+);
+
+/// A batch's requests checked, each against its own video (each probed once).
+async fn batch_items(
+    app: &AppHandle,
+    id: &str,
     requests: Vec<ExportRequest>,
-    mut cancel: watch::Receiver<bool>,
-) -> Result<Option<BatchReport>> {
-    let total = requests.len();
-    if !(1..=MAX_BATCH_EXPORTS).contains(&total) {
+) -> Result<BatchItems> {
+    if !(1..=MAX_BATCH_EXPORTS).contains(&requests.len()) {
         return Err("Choose between 1 and 16 files for a batch.".into());
     }
-    // Each request cuts from its own video; each video is probed once.
     let mut inputs: std::collections::HashMap<String, ExportSource> =
         std::collections::HashMap::new();
-    let mut items = Vec::with_capacity(total);
+    let mut items = Vec::with_capacity(requests.len());
     for request in requests {
-        let key = request.video.clone().unwrap_or_else(|| id.clone());
+        let key = request.video.clone().unwrap_or_else(|| id.to_string());
         if !inputs.contains_key(&key) {
-            let input = export_source(&app, &key).await?;
+            let input = export_source(app, &key).await?;
             inputs.insert(key.clone(), input);
         }
         let prepared = PreparedExport::new(request, &inputs[&key])?;
         items.push((key, prepared));
     }
+    Ok((inputs, items))
+}
+
+/// A batch rendered into a new folder inside one chosen when it was queued.
+pub async fn render_batch_into(
+    app: &AppHandle,
+    id: &str,
+    requests: Vec<ExportRequest>,
+    parent: PathBuf,
+    cancel: watch::Receiver<bool>,
+) -> Result<BatchReport> {
+    let (inputs, items) = batch_items(app, id, requests).await?;
+    batch_into(app, &inputs, &items, parent, cancel).await
+}
+
+pub async fn export_batch(
+    app: AppHandle,
+    id: String,
+    requests: Vec<ExportRequest>,
+    cancel: watch::Receiver<bool>,
+) -> Result<Option<BatchReport>> {
+    let (inputs, items) = batch_items(&app, &id, requests).await?;
     if *cancel.borrow() {
         return Ok(None);
     }
@@ -2978,8 +3258,22 @@ pub async fn export_batch(
         return Ok(None);
     }
     let parent = picked.into_path().map_err(|e| e.to_string())?;
+    batch_into(&app, &inputs, &items, parent, cancel)
+        .await
+        .map(Some)
+}
+
+/// Each item rendered into a new folder in `parent`, one after another; a failed item doesn't stop the rest.
+async fn batch_into(
+    app: &AppHandle,
+    inputs: &std::collections::HashMap<String, ExportSource>,
+    items: &[(String, PreparedExport)],
+    parent: PathBuf,
+    mut cancel: watch::Receiver<bool>,
+) -> Result<BatchReport> {
+    let total = items.len();
     let canonical = fs::canonicalize(&parent).await.map_err(|e| e.to_string())?;
-    let library = root(&app)?;
+    let library = root(app)?;
     let canonical_library = fs::canonicalize(&library).await.unwrap_or(library);
     if canonical.starts_with(canonical_library) {
         return Err("Choose a destination outside your source library.".into());
@@ -2993,7 +3287,10 @@ pub async fn export_batch(
         cancelled: false,
     };
     let mut progress = Tracker::new(vec!["Batch export"], |step| {
-        let _ = app.emit("studio-step", step);
+        // A queued render reports through the queue; the studio's step display is for the job in front.
+        if RENDER_PROGRESS.try_with(|_| ()).is_err() {
+            crate::jobs::show_step(&app, step);
+        }
     });
     for (index, (key, item)) in items.iter().enumerate() {
         let input = &inputs[key];
@@ -3009,13 +3306,27 @@ pub async fn export_batch(
             Some(title.clone()),
         );
         let target = folder.join(batch_name(index, title, shape));
+        // In the render queue, each item is its share of the batch's progress.
+        let render = render_prepared(app, input, &target, item);
+        let render = async {
+            match RENDER_PROGRESS.try_with(|report| report.clone()) {
+                Ok(report) => {
+                    let share: std::sync::Arc<dyn Fn(f64) + Send + Sync> =
+                        std::sync::Arc::new(move |done| {
+                            report((index as f64 + done) / total as f64)
+                        });
+                    RENDER_PROGRESS.scope(share, render).await
+                }
+                Err(_) => render.await,
+            }
+        };
         let rendered = tokio::select! {
             biased;
             _ = cancel.changed() => {
                 report.cancelled = true;
                 break;
             }
-            result = render_prepared(&app, input, &target, item) => result,
+            result = render => result,
         };
         match rendered {
             Ok(output) => report.outputs.push(output),
@@ -3032,7 +3343,7 @@ pub async fn export_batch(
     } else {
         report.folder = Some(folder.to_string_lossy().into_owned());
     }
-    Ok(Some(report))
+    Ok(report)
 }
 
 /// A safe file name from a title: letters, digits and dashes, the rest as underscores.
@@ -3404,22 +3715,16 @@ async fn render_captioned(
             args.extend(["-af", audio]);
         }
     }
-    args.extend([
-        "-c:v",
-        "libx264",
-        "-crf",
-        "18",
-        "-preset",
-        "fast",
+    let after = [
         "-pix_fmt",
         "yuv420p",
         "-c:a",
         "aac",
         "-movflags",
         "+faststart",
-        &destination,
-    ]);
-    run_in(captions, "ffmpeg", &args, 7200).await?;
+        destination,
+    ];
+    encode_with(captions, &video_encoders().await, &args, &after, paced).await?;
     temp.persist(target).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -4142,6 +4447,53 @@ mod tests {
         assert!(!loud.join("wave.part.png").exists());
         remove_folder(&loud).await.unwrap();
         assert!(!loud.exists());
+    }
+
+    /// Every caption face is set from its own bundled file, at the weight its style asks for.
+    #[tokio::test]
+    async fn every_caption_face_is_set_from_its_bundled_file() {
+        let fonts = Path::new(env!("CARGO_MANIFEST_DIR")).join("../public/fonts");
+        for (font, style, file) in [
+            ("montserrat", "bold", "Montserrat-Black"),
+            ("montserrat", "clean", "Montserrat-Regular"),
+            ("poppins", "bold", "Poppins-Bold"),
+            ("bebas", "pop", "BebasNeue-Regular"),
+            ("anton", "karaoke", "Anton-Regular"),
+        ] {
+            let captions = crate::captions::parse(&format!(
+                r#"{{"cues":[{{"start":0.2,"end":2.5,"text":"Hello captions","words":[{{"start":0.2,"end":1.0,"text":"Hello"}},{{"start":1.0,"end":2.5,"text":"captions"}}]}}],"style":"{style}","font":"{font}"}}"#
+            ))
+            .unwrap()
+            .unwrap();
+            let (script, _) = caption_script(&captions, 3.0, None, 1.0, 360, 640);
+            let folder = caption_folder(&fonts, &script).await.unwrap();
+            let rendered = command_output_in(
+                Some(folder.path()),
+                "ffmpeg",
+                &[
+                    "-v",
+                    "verbose",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=black:s=360x640:d=1",
+                    "-vf",
+                    "ass=captions.ass:fontsdir=fonts",
+                    "-ss",
+                    "0.5",
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                60,
+            )
+            .await
+            .unwrap();
+            let log = String::from_utf8_lossy(&rendered.stderr);
+            assert!(log.contains(&format!("-> {file}")), "{font} {style}: {log}");
+        }
     }
 
     #[tokio::test]
@@ -5143,6 +5495,173 @@ mod polish_tests {
         assert!(!music_graph(None, MusicMix::default(), 4.0, 1, true, None).contains("asplit"));
     }
 
+    #[test]
+    fn the_stacked_layout_puts_the_facecam_over_the_gameplay() {
+        let cam = CamBox {
+            x: 0.75,
+            y: 0.6,
+            w: 0.25,
+            h: 0.4,
+        };
+        let center = CropPosition::default();
+        let stack = stack_filter("vertical", 1280, 640, center, cam).unwrap();
+        // 360 × 640: a 268 px band of the 320 × 256 facecam in the corner, and 372 px of gameplay
+        // cut 618 px wide from the middle of the source.
+        assert_eq!(
+            stack,
+            "split[camsrc][gamesrc];[camsrc]crop=320:256:960:384,scale=360:268:force_original_aspect_ratio=increase:flags=lanczos,crop=360:268[cam];[gamesrc]crop=618:640:330:0,scale=360:372:flags=lanczos[game];[cam][game]vstack,setsar=1"
+        );
+        let left = stack_filter("vertical", 1280, 640, CropPosition { x: 0, y: 50 }, cam).unwrap();
+        assert!(left.contains("crop=618:640:0:0"));
+        assert!(stack_filter("landscape", 1280, 640, center, cam).is_err());
+        assert!(stack_filter("source", 1280, 640, center, cam).is_err());
+        let outside = CamBox { x: 0.9, ..cam };
+        assert!(stack_filter("vertical", 1280, 640, center, outside).is_err());
+    }
+
+    /// Real footage through the stacked layout: the export's top band is the facecam box of the
+    /// source and the rest is its gameplay part, compared as small grey thumbnails at the same
+    /// moment, each far closer to its own part of the source than to the other.
+    #[tokio::test]
+    async fn the_stacked_layout_shows_the_right_parts_of_real_footage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("stack.mp4");
+        let cam = CamBox {
+            x: 0.0,
+            y: 0.0,
+            w: 0.3,
+            h: 0.45,
+        };
+        let crop = CropPosition { x: 80, y: 50 };
+        let filter = stack_filter("vertical", 1280, 640, crop, cam).unwrap();
+        render_captioned(
+            &sample(),
+            &output,
+            4.0,
+            6.0,
+            &filter,
+            false,
+            None,
+            360,
+            640,
+            None,
+            MusicMix::default(),
+            true,
+            None,
+            24.0,
+            None,
+            "",
+            1.0,
+            None,
+            None,
+            false,
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        // A 12 × 9 grey thumbnail of a picture at a moment, after `crop`.
+        let thumb = |file: PathBuf, at: f64, crop: String| async move {
+            run(
+                "ffmpeg",
+                &[
+                    "-v",
+                    "error",
+                    "-ss",
+                    &format!("{at:.3}"),
+                    "-i",
+                    text(&file).unwrap(),
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    &format!("{crop},scale=12:9:flags=area,format=gray"),
+                    "-f",
+                    "rawvideo",
+                    "-",
+                ],
+                60,
+            )
+            .await
+            .unwrap()
+        };
+        let difference = |a: &[u8], b: &[u8]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| f64::from(x.abs_diff(*y)))
+                .sum::<f64>()
+                / a.len() as f64
+        };
+        // The source parts: the camera box (384 × 288 at the corner) and the gameplay (618 wide,
+        // 80% of the way across: x = (1280 - 618) × 0.8 = 529.6, even 528).
+        let (top, bottom) = (
+            thumb(output.clone(), 1.0, "crop=360:268:0:0".into()).await,
+            thumb(output.clone(), 1.0, "crop=360:372:0:268".into()).await,
+        );
+        let (cam_part, game_part) = (
+            thumb(
+                sample(),
+                5.0,
+                "crop=384:288:0:0,scale=360:268:force_original_aspect_ratio=increase,crop=360:268"
+                    .into(),
+            )
+            .await,
+            thumb(sample(), 5.0, "crop=618:640:528:0".into()).await,
+        );
+        let (top_cam, top_game) = (difference(&top, &cam_part), difference(&top, &game_part));
+        let (bottom_game, bottom_cam) = (
+            difference(&bottom, &game_part),
+            difference(&bottom, &cam_part),
+        );
+        assert!(top_cam < 10.0, "top band {top_cam} from the camera box");
+        assert!(bottom_game < 10.0, "gameplay {bottom_game} from its part");
+        assert!(top_game > top_cam * 2.0, "{top_game} vs {top_cam}");
+        assert!(
+            bottom_cam > bottom_game * 2.0,
+            "{bottom_cam} vs {bottom_game}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_stacked_layout_renders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("stack.mp4");
+        let cam = CamBox {
+            x: 0.0,
+            y: 0.0,
+            w: 0.3,
+            h: 0.45,
+        };
+        let filter = stack_filter("portrait", 1280, 640, CropPosition::default(), cam).unwrap();
+        render_captioned(
+            &sample(),
+            &output,
+            1.0,
+            2.0,
+            &filter,
+            false,
+            None,
+            512,
+            640,
+            None,
+            MusicMix::default(),
+            true,
+            None,
+            24.0,
+            None,
+            "",
+            1.0,
+            None,
+            None,
+            false,
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        let (_, w, h, _, _) = probe(&output).await.unwrap();
+        assert_eq!((w, h), (512, 640));
+    }
+
     #[tokio::test]
     async fn split_punch_ins_and_filler_cuts_render() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5465,5 +5984,140 @@ mod text_tests {
         let (duration, w, h, _, _) = probe(&output).await.unwrap();
         assert!((duration - 1.5).abs() < 0.1);
         assert_eq!((w, h), (360, 640));
+    }
+}
+
+#[cfg(test)]
+mod encoder_tests {
+    use super::*;
+
+    #[test]
+    fn every_hardware_encoder_has_export_settings() {
+        for encoder in HARDWARE_ENCODERS {
+            let args = hardware_export(encoder.codec).unwrap();
+            assert_eq!(&args[..2], &["-c:v", encoder.codec]);
+        }
+        assert!(hardware_export("libx264").is_none());
+    }
+
+    /// On a computer with a graphics encoder (NVENC, AMF, Quick Sync, VideoToolbox), an export of
+    /// real footage is made by it, at the export's quality: within 38 dB PSNR of the source. Where
+    /// none opens (CI runners), there is nothing to check.
+    #[tokio::test]
+    async fn the_graphics_card_encodes_a_real_export_when_it_can() {
+        let Some(encoder) = hardware_encoder().await else {
+            eprintln!("No graphics encoder opens here; nothing to check.");
+            return;
+        };
+        let sample = Path::new(env!("CARGO_MANIFEST_DIR")).join("../public/sample/alpine.mp4");
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("gpu.mp4");
+        let (input, out) = (text(&sample).unwrap(), text(&output).unwrap());
+        let crop = "crop=360:640:460:0,setsar=1";
+        encode_with(
+            None,
+            &[hardware_export(encoder.codec).unwrap()],
+            &[
+                "-v", "error", "-y", "-ss", "2", "-t", "4", "-i", input, "-vf", crop,
+            ],
+            &["-pix_fmt", "yuv420p", "-an", out],
+            4.0,
+        )
+        .await
+        .unwrap();
+        let tags = run(
+            "ffprobe",
+            &[
+                "-v",
+                "error",
+                "-select_streams",
+                "v",
+                "-show_entries",
+                "stream_tags=encoder",
+                "-of",
+                "csv=p=0",
+                out,
+            ],
+            30,
+        )
+        .await
+        .unwrap();
+        assert!(
+            String::from_utf8_lossy(&tags).contains(encoder.codec),
+            "{}",
+            String::from_utf8_lossy(&tags)
+        );
+        // How close the export is to the same crop of the source.
+        let lavfi = format!("[1:v]{crop}[ref];[0:v][ref]psnr");
+        let compared = command_output(
+            "ffmpeg",
+            &[
+                "-v", "info", "-i", out, "-ss", "2", "-t", "4", "-i", input, "-lavfi", &lavfi,
+                "-f", "null", "-",
+            ],
+            60,
+        )
+        .await
+        .unwrap();
+        let log = String::from_utf8_lossy(&compared.stderr);
+        let psnr: f64 = log
+            .split("average:")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{log}"));
+        assert!(psnr > 38.0, "{} at {psnr} dB", encoder.codec);
+    }
+
+    #[tokio::test]
+    async fn an_encoder_that_fails_falls_back_to_the_next() {
+        let sample = Path::new(env!("CARGO_MANIFEST_DIR")).join("../public/sample/alpine.mp4");
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("fallback.mp4");
+        let out = text(&output).unwrap();
+        let input = text(&sample).unwrap();
+        let broken: &[&str] = &["-c:v", "h264_nonexistent"];
+        encode_with(
+            None,
+            &[broken, SOFTWARE_EXPORT],
+            &["-v", "error", "-y", "-ss", "1", "-t", "0.5", "-i", input],
+            &["-pix_fmt", "yuv420p", "-an", out],
+            0.5,
+        )
+        .await
+        .unwrap();
+        let (duration, _, _, _, _) = probe(&output).await.unwrap();
+        assert!((duration - 0.5).abs() < 0.1);
+        // With nothing left to try, the last error comes back.
+        assert!(encode_with(
+            None,
+            &[broken],
+            &["-v", "error", "-y", "-i", input],
+            &["-an", out],
+            1.0
+        )
+        .await
+        .is_err());
+        // Inside a queued render, the encode says how far it is.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let heard = seen.clone();
+        let report: std::sync::Arc<dyn Fn(f64) + Send + Sync> =
+            std::sync::Arc::new(move |done| heard.lock().unwrap().push(done));
+        RENDER_PROGRESS
+            .scope(
+                report,
+                encode_with(
+                    None,
+                    &[SOFTWARE_EXPORT],
+                    &["-v", "error", "-y", "-ss", "1", "-t", "1", "-i", input],
+                    &["-pix_fmt", "yuv420p", "-an", out],
+                    1.0,
+                ),
+            )
+            .await
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty());
+        assert!(seen.iter().all(|done| (0.0..=1.0).contains(done)));
     }
 }

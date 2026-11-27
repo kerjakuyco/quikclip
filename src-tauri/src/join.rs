@@ -5,7 +5,7 @@ use crate::media::{self, ExportRequest, Result};
 use crate::progress::Tracker;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 use tauri_plugin_dialog::DialogExt;
 use tokio::{fs, sync::watch};
 use uuid::Uuid;
@@ -141,32 +141,26 @@ pub async fn join_files(
     for file in files {
         args.extend(["-i".into(), media::text(file)?.to_string()]);
     }
-    args.extend(
-        [
-            "-filter_complex",
-            &graph,
-            "-map",
-            "[v]",
-            "-map",
-            "[a]",
-            "-c:v",
-            "libx264",
-            "-crf",
-            "18",
-            "-preset",
-            "fast",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-movflags",
-            "+faststart",
-        ]
-        .map(String::from),
-    );
-    args.push(media::text(&temp)?.to_string());
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    media::run("ffmpeg", &refs, 7200).await?;
+    args.extend(["-filter_complex", &graph, "-map", "[v]", "-map", "[a]"].map(String::from));
+    let before: Vec<&str> = args.iter().map(String::as_str).collect();
+    let destination = media::text(&temp)?;
+    let after = [
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        destination,
+    ];
+    media::encode_with(
+        None,
+        &media::video_encoders().await,
+        &before,
+        &after,
+        length,
+    )
+    .await?;
     temp.persist(target).map_err(|e| e.to_string())?;
     Ok(length)
 }
@@ -258,7 +252,7 @@ pub async fn export_joined(
     transition: String,
     intro: Option<String>,
     outro: Option<String>,
-    mut cancel: watch::Receiver<bool>,
+    cancel: watch::Receiver<bool>,
 ) -> Result<Option<String>> {
     xfade_name(&transition)?;
     if !(1..=MAX_JOINED).contains(&requests.len()) {
@@ -298,6 +292,57 @@ pub async fn export_joined(
     if target.starts_with(media::root(&app)?) {
         return Err("Choose a destination outside your source library.".into());
     }
+    join_into(&app, &items, intro, outro, &transition, &target, cancel)
+        .await
+        .map(Some)
+}
+
+type Prepared = (media::ExportSource, media::PreparedExport);
+
+/// Clips joined into a file chosen when they were queued.
+#[allow(clippy::too_many_arguments)]
+pub async fn render_joined_to(
+    app: &AppHandle,
+    id: &str,
+    requests: Vec<ExportRequest>,
+    transition: &str,
+    intro: Option<String>,
+    outro: Option<String>,
+    target: &Path,
+    cancel: watch::Receiver<bool>,
+) -> Result<String> {
+    xfade_name(transition)?;
+    if !(1..=MAX_JOINED).contains(&requests.len()) {
+        return Err("Join between 1 and 40 clips.".into());
+    }
+    let intro = match intro.filter(|path| !path.is_empty()) {
+        Some(path) => Some(owned_bookend(app, &path).await?),
+        None => None,
+    };
+    let outro = match outro.filter(|path| !path.is_empty()) {
+        Some(path) => Some(owned_bookend(app, &path).await?),
+        None => None,
+    };
+    let items = media::prepare_all(app, id, requests).await?;
+    if let Some((input, _)) = items.first() {
+        media::check_target(app, target, input.path())?;
+    }
+    join_into(app, &items, intro, outro, transition, target, cancel).await
+}
+
+/// Each clip rendered as a part, then the parts joined between the bookends.
+async fn join_into(
+    app: &AppHandle,
+    items: &[Prepared],
+    intro: Option<PathBuf>,
+    outro: Option<PathBuf>,
+    transition: &str,
+    target: &Path,
+    mut cancel: watch::Receiver<bool>,
+) -> Result<String> {
+    let report = media::RENDER_PROGRESS
+        .try_with(|report| report.clone())
+        .ok();
     let parent = target.parent().ok_or("Invalid destination.")?;
     let work = tempfile::Builder::new()
         .prefix(".quikclip-join-")
@@ -305,7 +350,9 @@ pub async fn export_joined(
         .map_err(|e| e.to_string())?;
     let total = items.len();
     let mut progress = Tracker::new(vec!["Clips", "Joining"], |step| {
-        let _ = app.emit("studio-step", step);
+        if report.is_none() {
+            crate::jobs::show_step(app, step);
+        }
     });
     let mut files: Vec<PathBuf> = intro.into_iter().collect();
     for (index, (input, item)) in items.iter().enumerate() {
@@ -316,10 +363,25 @@ pub async fn export_joined(
             Some(item.title().to_string()),
         );
         let part = work.path().join(format!("part-{index:02}.mp4"));
+        // In the render queue the parts are the first 85%, the join the rest.
+        let render = media::render_part(app, input, &part, item);
+        let render = async {
+            match &report {
+                Some(report) => {
+                    let report = report.clone();
+                    let share: std::sync::Arc<dyn Fn(f64) + Send + Sync> =
+                        std::sync::Arc::new(move |done| {
+                            report(0.85 * (index as f64 + done) / total as f64)
+                        });
+                    media::RENDER_PROGRESS.scope(share, render).await
+                }
+                None => render.await,
+            }
+        };
         tokio::select! {
             biased;
             _ = cancel.changed() => return Err("Operation cancelled.".into()),
-            result = media::render_part(&app, input, &part, item) => result?,
+            result = render => result?,
         };
         files.push(part);
     }
@@ -341,12 +403,24 @@ pub async fn export_joined(
         None,
         None,
     );
+    let join = join_files(&files, target, size, transition);
+    let join = async {
+        match &report {
+            Some(report) => {
+                let report = report.clone();
+                let share: std::sync::Arc<dyn Fn(f64) + Send + Sync> =
+                    std::sync::Arc::new(move |done| report(0.85 + 0.15 * done));
+                media::RENDER_PROGRESS.scope(share, join).await
+            }
+            None => join.await,
+        }
+    };
     tokio::select! {
         biased;
         _ = cancel.changed() => return Err("Operation cancelled.".into()),
-        result = join_files(&files, &target, size, &transition) => { result?; }
+        result = join => { result?; }
     };
-    Ok(Some(media::text(&target)?.to_string()))
+    Ok(media::text(target)?.to_string())
 }
 
 #[cfg(test)]

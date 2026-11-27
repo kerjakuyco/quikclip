@@ -209,6 +209,7 @@ mod tests {
                 port: None,
                 account_id: None,
                 gateway: None,
+                model: None,
             },
             Some("fixture-token"),
         )

@@ -9,9 +9,12 @@ mod media;
 mod post;
 mod progress;
 mod providers;
+mod renders;
+mod suggest;
 mod texts;
 mod transcript;
 mod translate;
+mod workspace;
 
 use tauri::Manager;
 
@@ -29,6 +32,7 @@ pub fn run() {
             Ok(())
         })
         .manage(jobs::Jobs::default())
+        .manage(renders::Renders::default())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             jobs::import_local,
@@ -51,8 +55,20 @@ pub fn run() {
             jobs::find_highlights,
             faces::find_faces,
             post::write_post_copy,
+            suggest::suggest_for_clip,
             assistant::ask_assistant,
             jobs::cancel_job,
+            jobs::set_gpu_exports,
+            jobs::current_job,
+            jobs::take_kept_import,
+            renders::pick_export_file,
+            renders::pick_export_folder,
+            renders::render_clip,
+            renders::render_batch,
+            renders::render_joined,
+            renders::cancel_render,
+            workspace::read_workspace,
+            workspace::write_workspace,
             providers::connect_ai,
             providers::forget_ai
         ])

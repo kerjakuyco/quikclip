@@ -13,6 +13,9 @@ pub enum Provider {
     LmStudio,
     OpenRouter,
     Cloudflare,
+    /// A Whisper server on this computer that speaks OpenAI's transcription API: whisper.cpp's server, Speaches, or
+    /// faster-whisper-server. Speech to text with nothing leaving the machine.
+    Whisper,
 }
 
 #[derive(Clone, Deserialize)]
@@ -22,14 +25,17 @@ pub struct Connection {
     pub port: Option<u16>,
     pub account_id: Option<String>,
     pub gateway: Option<String>,
+    /// The speech model a local Whisper server should use, when it serves more than one.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 impl Connection {
     fn port(&self) -> u16 {
-        self.port.unwrap_or(if self.provider == Provider::Ollama {
-            11434
-        } else {
-            1234
+        self.port.unwrap_or(match self.provider {
+            Provider::Ollama => 11434,
+            Provider::Whisper => 8000,
+            _ => 1234,
         })
     }
     fn gateway(&self) -> &str {
@@ -47,14 +53,15 @@ impl Connection {
             Provider::LmStudio => "LM Studio",
             Provider::OpenRouter => "OpenRouter",
             Provider::Cloudflare => "Cloudflare AI Gateway",
+            Provider::Whisper => "Whisper server",
         }
     }
     fn base(&self) -> Result<String> {
         match self.provider {
-            Provider::Ollama | Provider::LmStudio if self.port() == 0 => {
+            Provider::Ollama | Provider::LmStudio | Provider::Whisper if self.port() == 0 => {
                 Err("Enter a port between 1 and 65535.".into())
             }
-            Provider::Ollama | Provider::LmStudio => {
+            Provider::Ollama | Provider::LmStudio | Provider::Whisper => {
                 Ok(format!("http://127.0.0.1:{}", self.port()))
             }
             Provider::OpenRouter => Ok("https://openrouter.ai/api/v1".into()),
@@ -79,7 +86,7 @@ impl Connection {
     }
     fn credential_id(&self) -> Option<String> {
         match self.provider {
-            Provider::Ollama => None,
+            Provider::Ollama | Provider::Whisper => None,
             Provider::OpenRouter => Some("openrouter".into()),
             Provider::LmStudio => Some(format!("lmstudio-{}", self.port())),
             Provider::Cloudflare => Some(format!(
@@ -242,6 +249,8 @@ impl Session {
     }
     async fn models(&self) -> Result<Vec<Model>> {
         let mut models = match self.config.provider {
+            // A Whisper server hears; it has no vision models to list.
+            Provider::Whisper => Vec::new(),
             Provider::Ollama => {
                 let response = self.get("/api/tags").await?;
                 let mut out = Vec::new();
@@ -291,6 +300,9 @@ impl Session {
     /// Speech to text for a clip's audio (16 kHz mono MP3) with Whisper large v3 turbo, the model clip-ai transcribes with
     /// (service/pipeline.py transcription_model). Local providers have no speech model.
     pub async fn transcribe(&self, mp3: &[u8], language: Option<&str>) -> Result<Value> {
+        if self.config.provider == Provider::Whisper {
+            return self.transcribe_locally(mp3, language).await;
+        }
         let audio = STANDARD.encode(mp3);
         let (route, mut body) = match self.config.provider {
             // Only endpoints that keep nothing and train on nothing (clip-ai PRIVATE_ROUTING).
@@ -323,6 +335,39 @@ impl Session {
             Some(inner) if inner.is_object() => inner.clone(),
             _ => response,
         })
+    }
+    /// Speech to text on this computer: OpenAI's transcription request (a multipart upload) to a local Whisper
+    /// server, asking for timed words. A server that only times its segments still works: their words are spread over
+    /// each segment's time when the transcript is read (captions.rs transcript_words).
+    async fn transcribe_locally(&self, mp3: &[u8], language: Option<&str>) -> Result<Value> {
+        let part = reqwest::multipart::Part::bytes(mp3.to_vec())
+            .file_name("audio.mp3")
+            .mime_str("audio/mpeg")
+            .map_err(|e| e.to_string())?;
+        let model = self
+            .config
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty() && m.len() <= 200)
+            .unwrap_or("whisper-1")
+            .to_string();
+        let mut form = reqwest::multipart::Form::new()
+            .part("file", part)
+            .text("model", model)
+            .text("response_format", "verbose_json")
+            .text("timestamp_granularities[]", "word")
+            .text("timestamp_granularities[]", "segment");
+        if let Some(language) = language {
+            form = form.text("language", language.to_string());
+        }
+        // A model on a CPU can take a while over a 10-minute part.
+        self.json(
+            self.req(reqwest::Method::POST, "/v1/audio/transcriptions")
+                .timeout(Duration::from_secs(3600))
+                .multipart(form),
+        )
+        .await
     }
     /// A text-only answer (the transcript's highlights): a system brief and the user's text, answered as JSON.
     pub async fn chat(&self, model: &str, system: &str, user: &str) -> Result<String> {
@@ -518,6 +563,7 @@ mod tests {
                 port: None,
                 account_id: Some("a".repeat(32)),
                 gateway: Some("studio".into()),
+                model: None,
             };
             let mut session = Session::new(config, Some("fixture-token")).await.unwrap();
             let server = Server::http("127.0.0.1:0").unwrap();
@@ -604,6 +650,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_local_whisper_server_gets_an_openai_upload() {
+        let config = Connection {
+            provider: Provider::Whisper,
+            port: Some(9),
+            account_id: None,
+            gateway: None,
+            model: Some("Systran/faster-whisper-small".into()),
+        };
+        let mut session = Session::new(config, None).await.unwrap();
+        let server = Server::http("127.0.0.1:0").unwrap();
+        session.base = format!("http://{}", server.server_addr());
+        let worker = std::thread::spawn(move || {
+            let mut req = server
+                .recv_timeout(Duration::from_secs(8))
+                .unwrap()
+                .expect("request");
+            assert_eq!(req.url(), "/v1/audio/transcriptions");
+            let kind = req
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv("Content-Type"))
+                .map(|h| h.value.to_string())
+                .unwrap();
+            assert!(kind.starts_with("multipart/form-data"));
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            for part in [
+                "name=\"model\"\r\n\r\nSystran/faster-whisper-small",
+                "name=\"response_format\"\r\n\r\nverbose_json",
+                "name=\"timestamp_granularities[]\"\r\n\r\nword",
+                "name=\"language\"\r\n\r\nid",
+                "filename=\"audio.mp3\"",
+                "mp3",
+            ] {
+                assert!(body.contains(part), "missing {part}");
+            }
+            // A server that times only its segments.
+            let answer = json!({"text":"halo semua","segments":[{"start":0.0,"end":1.0,"text":"halo semua"}]});
+            req.respond(Response::from_string(answer.to_string()))
+                .unwrap();
+        });
+        let transcript = session.transcribe(b"mp3", Some("id")).await.unwrap();
+        worker.join().unwrap();
+        let words = crate::captions::transcript_words(&transcript, 10.0);
+        assert_eq!(words.len(), 2);
+        assert_eq!((words[0].start, words[1].end), (10.0, 11.0));
+    }
+    #[tokio::test]
     async fn speech_goes_to_whisper_and_comes_back_as_a_transcript() {
         for provider in [Provider::OpenRouter, Provider::Cloudflare] {
             let config = Connection {
@@ -611,6 +705,7 @@ mod tests {
                 port: None,
                 account_id: Some("a".repeat(32)),
                 gateway: Some("studio".into()),
+                model: None,
             };
             let mut session = Session::new(config, Some("fixture-token")).await.unwrap();
             let server = Server::http("127.0.0.1:0").unwrap();
@@ -658,6 +753,7 @@ mod tests {
                 port: None,
                 account_id: None,
                 gateway: None,
+                model: None,
             },
             None,
         )
@@ -683,6 +779,7 @@ mod tests {
                 port: None,
                 account_id: Some("a".repeat(32)),
                 gateway: None,
+                model: None,
             };
             let session = Session::new(config, Some("fixture-token")).await.unwrap();
             let server = Server::http("127.0.0.1:0").unwrap();

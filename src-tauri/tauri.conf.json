@@ -35,6 +35,6 @@
     "targets": "all",
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
     "externalBin": ["binaries/quikclip-yt-dlp", "binaries/quikclip-qjs", "binaries/quikclip-ffmpeg", "binaries/quikclip-ffprobe"],
-    "resources": { "../public/sample/alpine.mp4": "sample/alpine.mp4", "../public/fonts/": "fonts/", "tool-notices/": "notices/", "../LICENSE": "notices/GPL-3.0.txt", "../THIRD_PARTY_TOOLS.md": "notices/THIRD_PARTY_TOOLS.md" }
+    "resources": { "../public/sample/alpine.mp4": "sample/alpine.mp4", "../public/fonts/": "fonts/", "models/": "models/", "tool-notices/": "notices/", "../LICENSE": "notices/GPL-3.0.txt", "../THIRD_PARTY_TOOLS.md": "notices/THIRD_PARTY_TOOLS.md" }
   }
 }

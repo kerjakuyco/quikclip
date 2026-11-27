@@ -5,7 +5,7 @@ use crate::providers::{Connection, Session};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
 use std::time::Instant;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 /// Highlights from what was said when the video has a transcript, as ClipCheap finds them (highlights.rs); else from nine
 /// frames across it, for a video with no speech or one not transcribed yet.
@@ -39,73 +39,97 @@ async fn from_transcript(
     let events = app.clone();
     let mut track = Tracker::new(
         vec!["Read transcript", "Find highlights", "Review cuts"],
-        move |step| {
-            let _ = events.emit("studio-step", step);
-        },
+        move |step| crate::jobs::show_step(&events, step),
     );
     track.show("Read transcript", "Connecting", None, None);
     let session = Session::new(connection, None).await?;
     let (duration, ..) = probe(&source(app, id)?).await?;
-    let text = highlights::prompt_lines(lines);
-    if text.len() > highlights::MAX_PROMPT_CHARS {
-        return Err(
-            "This video's transcript is too long to read at once. Mark clips by hand, or split the video.".into(),
-        );
-    }
     track.about(format!("{} transcript · {model}", clock(duration)));
-    track.show(
-        "Find highlights",
-        format!("Waiting for {name}"),
-        None,
-        Some(format!(
-            "The model is reading {} sentences of transcript",
-            lines.len()
-        )),
-    );
+    // A long transcript, or many clips, is read a section at a time, each with its share of the clips.
+    let wanted = options.wanted();
+    let parts = highlights::sections(lines, wanted);
+    let mut candidates = Vec::new();
     let asked = Instant::now();
-    let answer = session
-        .chat(
-            model,
-            &highlights::system_prompt(duration, options),
-            &format!("<transcript>\n{text}\n</transcript>"),
-        )
-        .await?;
+    for (index, (range, share)) in parts.iter().enumerate() {
+        let text = highlights::prompt_section(lines, range.clone());
+        if text.len() > highlights::MAX_PROMPT_CHARS {
+            return Err("This video's transcript is too long to read. Mark clips by hand, or split the video.".into());
+        }
+        track.show(
+            "Find highlights",
+            if parts.len() > 1 {
+                format!("Reading part {} of {} with {name}", index + 1, parts.len())
+            } else {
+                format!("Waiting for {name}")
+            },
+            (parts.len() > 1).then(|| index as f64 / parts.len() as f64),
+            Some(format!(
+                "The model is reading {} sentences of transcript",
+                range.len()
+            )),
+        );
+        let part = (parts.len() > 1).then(|| (lines[range.start].start, lines[range.end - 1].end));
+        let answer = session
+            .chat(
+                model,
+                &highlights::section_prompt(duration, options, *share, part),
+                &format!("<transcript>\n{text}\n</transcript>"),
+            )
+            .await?;
+        match highlights::parse_candidates(&answer) {
+            Ok(found) => candidates.extend(found),
+            // One part the model couldn't answer leaves the others.
+            Err(error) if parts.len() == 1 => return Err(error),
+            Err(_) => {}
+        }
+    }
     eprintln!(
-        "[highlights] transcript of {} lines, {name} {model} {:.1}s",
+        "[highlights] transcript of {} lines in {} part(s), {name} {model} {:.1}s",
         lines.len(),
+        parts.len(),
         asked.elapsed().as_secs_f64()
     );
-    let picks = highlights::select_highlights(
-        &highlights::parse_candidates(&answer)?,
-        lines,
-        duration,
-        options,
-    );
+    let picks = highlights::select_highlights(&candidates, lines, duration, options, wanted);
     if picks.is_empty() {
         return Err(format!(
             "No self-contained moments of {:.0} to {:.0} seconds were found. Try again, or mark a clip by hand.",
-            SearchOptions::minimum(duration),
+            options.minimum(duration),
             options.max_seconds
         ));
     }
-    // A second read of the exact cuts keeps the strong ones and writes each a hook line. If it fails, the first read
-    // stands.
+    // A second read of the exact cuts, eight at a time, keeps the strong ones, offers the near-misses, and writes each a
+    // hook line. If it fails, the first read stands.
     track.show(
         "Review cuts",
         format!("Reviewing {} cuts with {name}", picks.len()),
         None,
         Some("Checking each cut stands alone and ends on its payoff".into()),
     );
-    let reviews = session
-        .chat(
-            model,
-            &highlights::review_prompt(),
-            &highlights::review_request(&picks, lines),
-        )
-        .await
-        .ok()
-        .and_then(|answer| highlights::parse_reviews(&answer));
-    Ok(highlights::apply_reviews(picks, reviews))
+    let mut reviews = Vec::new();
+    let mut read = false;
+    for (batch, chunk) in picks.chunks(8).enumerate() {
+        let answer = session
+            .chat(
+                model,
+                &highlights::review_prompt(),
+                &highlights::review_request(chunk, lines),
+            )
+            .await
+            .ok()
+            .and_then(|answer| highlights::parse_reviews(&answer));
+        if let Some(found) = answer {
+            read = true;
+            reviews.extend(found.into_iter().map(|mut review| {
+                review.id += batch * 8;
+                review
+            }));
+        }
+    }
+    Ok(highlights::apply_reviews(
+        picks,
+        read.then_some(reviews),
+        options.count,
+    ))
 }
 
 async fn from_frames(
@@ -118,7 +142,7 @@ async fn from_frames(
     let name = connection.label();
     let events = app.clone();
     let mut track = Tracker::new(vec!["Sample frames", "Find highlights"], move |step| {
-        let _ = events.emit("studio-step", step);
+        crate::jobs::show_step(&events, step)
     });
     track.show("Sample frames", "Connecting", None, None);
     let session = Session::new(connection, None).await?;
@@ -281,6 +305,7 @@ fn frame_picks(response: &str, duration: f64, options: SearchOptions) -> Result<
                 start: c.start,
                 end: c.end.min(duration),
                 highlight: EditorialNote::new(c.score, c.rationale.as_deref()),
+                approved: true,
             });
             if clips.len() == options.count {
                 break;
@@ -318,6 +343,7 @@ mod tests {
             SearchOptions {
                 count: 2,
                 max_seconds: 30,
+                min_seconds: None,
             },
         )
         .unwrap();

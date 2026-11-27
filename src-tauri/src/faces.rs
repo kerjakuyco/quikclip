@@ -1,12 +1,20 @@
-//! Face samples for the calm camera. Windows uses the system face detector on frames
-//! scaled so the long side is at most 960 px. A face that shows up in only one sample is
-//! ignored later, in `calmPath`. For following the speaker, each face also gets how much its
-//! mouth moves (clip-ai `reframe.speaker_track`'s mouth activity), from two grey frames 0.12 s
-//! apart.
+//! Face samples for the calm camera. Windows uses the system face detector on frames scaled so
+//! the long side is at most 960 px; macOS and Linux, and a Windows PC without that detector, use
+//! SeetaFace's frontal detector (the `rustface` port, BSD 2-Clause, its model bundled from
+//! `models/`) on grey frames 640 px wide. A face that shows up in only one sample is ignored
+//! later, in `calmPath`. For following the speaker, each face also gets how much its mouth moves
+//! (clip-ai `reframe.speaker_track`'s mouth activity), from two grey frames 0.12 s apart.
 use crate::media::{self, Result};
 use serde::Serialize;
-use std::path::{Path, PathBuf};
-use tauri::AppHandle;
+use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
+use tauri::{AppHandle, Manager};
+
+/// SeetaFace's frontal face model, bundled with the app (tauri.conf.json resources).
+const MODEL_FILE: &str = "models/seeta_fd_frontal_v1.0.bin";
+/// Width of the grey frames the portable detector reads.
+const DETECT_WIDTH: u32 = 640;
 
 #[derive(Clone, Serialize)]
 pub struct FaceBox {
@@ -83,25 +91,121 @@ pub async fn find_faces(
     if !media::valid_range(start, end, duration) {
         return Err("The cut must be inside the source and at least 0.25 seconds long.".into());
     }
-    #[cfg(not(windows))]
-    {
-        let _ = (path, start, end, speaker, width, height);
-        Err("Face tracking is available in the Windows desktop app.".into())
-    }
+    let step = sample_step(end - start, speaker);
+    // The system detector where Windows has one, else the bundled one.
     #[cfg(windows)]
-    {
-        let step = sample_step(end - start, speaker);
-        let mut samples = detect_clip(&path, start, end, step).await?;
-        if speaker {
-            add_motion(&path, start, end, step, width, height, &mut samples).await?;
-        }
-        Ok(samples)
+    let found = match detect_clip(&path, start, end, step).await {
+        Ok(samples) => Ok(samples),
+        Err(_) => detect_portable(&app, &path, start, end, step, width, height).await,
+    };
+    #[cfg(not(windows))]
+    let found = detect_portable(&app, &path, start, end, step, width, height).await;
+    let mut samples = found?;
+    if speaker {
+        add_motion(&path, start, end, step, width, height, &mut samples).await?;
+    }
+    Ok(samples)
+}
+
+/// Where the bundled face model is: beside the app, or in the source tree when run from it.
+fn model_path(app: &AppHandle) -> std::path::PathBuf {
+    let bundled = app.path().resource_dir().map(|dir| dir.join(MODEL_FILE));
+    match bundled {
+        Ok(path) if path.exists() => path,
+        _ => Path::new(env!("CARGO_MANIFEST_DIR")).join(MODEL_FILE),
     }
 }
 
-/// Grey frames of the clip at the sample step, `GREY_WIDTH` wide, from `offset` seconds after
-/// its in point, as raw bytes.
-#[cfg_attr(not(windows), allow(dead_code))]
+/// Faces found by the bundled detector, on grey frames `DETECT_WIDTH` wide.
+async fn detect_portable(
+    app: &AppHandle,
+    path: &Path,
+    start: f64,
+    end: f64,
+    step: f64,
+    width: u64,
+    height: u64,
+) -> Result<Vec<FaceSample>> {
+    if width == 0 || height == 0 {
+        return Err("This video has no picture to look for faces in.".into());
+    }
+    detect_video(&model_path(app), path, start, end, step, width, height).await
+}
+
+/// Faces in a video's frames, sampled `step` seconds apart, by the bundled detector.
+async fn detect_video(
+    model: &Path,
+    path: &Path,
+    start: f64,
+    end: f64,
+    step: f64,
+    width: u64,
+    height: u64,
+) -> Result<Vec<FaceSample>> {
+    let wide = DETECT_WIDTH.min(width as u32 / 2 * 2).max(2);
+    let tall = ((wide as f64 * height as f64 / width as f64 / 2.0).round() as u32).max(1) * 2;
+    let frames = grey_frames(path, start, end - start, step, (wide, tall)).await?;
+    let model = model.to_path_buf();
+    tokio::task::spawn_blocking(move || detect_grey(&model, &frames, wide, tall, start, step))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Faces in grey frames (`width` × `height` bytes each, back to back), sampled `step` seconds
+/// apart from `start`, found by SeetaFace's frontal detector, as shares of the frame.
+pub fn detect_grey(
+    model: &Path,
+    frames: &[u8],
+    width: u32,
+    height: u32,
+    start: f64,
+    step: f64,
+) -> Result<Vec<FaceSample>> {
+    let file = std::fs::File::open(model)
+        .map_err(|_| "The face model is missing from this install of Quikclip.".to_string())?;
+    let model = rustface::read_model(std::io::BufReader::new(file))
+        .map_err(|_| "The face model could not be read.".to_string())?;
+    let mut detector = rustface::create_detector_with_model(model);
+    // Faces down to a twentieth of the frame's height, as small as a wide shot's.
+    detector.set_min_face_size((height / 20).max(20));
+    detector.set_score_thresh(2.0);
+    detector.set_pyramid_scale_factor(0.8);
+    detector.set_slide_window_step(4, 4);
+    let frame = (width * height) as usize;
+    if frame == 0 || frames.len() < frame {
+        return Err("No frames could be read from this clip.".into());
+    }
+    let share = |n: f64, of: u32| (n / of as f64).clamp(0.0, 1.0);
+    Ok(frames
+        .chunks_exact(frame)
+        .enumerate()
+        .map(|(index, pixels)| {
+            let faces = detector
+                .detect(&rustface::ImageData::new(pixels, width, height))
+                .into_iter()
+                .map(|face| {
+                    let b = face.bbox();
+                    let (x, y) = (share(b.x() as f64, width), share(b.y() as f64, height));
+                    FaceBox {
+                        x,
+                        y,
+                        w: share(b.x() as f64 + b.width() as f64, width) - x,
+                        h: share(b.y() as f64 + b.height() as f64, height) - y,
+                        motion: None,
+                    }
+                })
+                .filter(|face| face.w > 0.0 && face.h > 0.0)
+                .collect();
+            FaceSample {
+                time: start + index as f64 * step,
+                faces,
+            }
+        })
+        .collect())
+}
+
+/// Grey frames of the clip at the sample step, `size` big, from `start` for `span` seconds, as
+/// raw bytes.
 async fn grey_frames(
     path: &Path,
     start: f64,
@@ -139,7 +243,6 @@ async fn grey_frames(
 }
 
 /// Each face's mouth movement, from grey frames at each sample and 0.12 s after it.
-#[cfg_attr(not(windows), allow(dead_code))]
 async fn add_motion(
     path: &Path,
     start: f64,
@@ -329,6 +432,100 @@ fn faces_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real face moving across real video: the portrait glides right over three seconds of a
+    /// 1280 × 720 film, and every sample finds the face where it is at that moment.
+    #[tokio::test]
+    async fn a_face_moving_across_a_video_is_found_in_every_sample() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let tmp = tempfile::tempdir().unwrap();
+        let film = tmp.path().join("moving.mp4");
+        media::run(
+            "ffmpeg",
+            &[
+                "-v",
+                "error",
+                "-loop",
+                "1",
+                "-i",
+                dir.join("tests/assets/portrait.jpg").to_str().unwrap(),
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=0x1a1d24:s=1280x720:r=24:d=3",
+                "-filter_complex",
+                "[0:v]scale=480:600[p];[1:v][p]overlay=x='100+200*t':y=60:shortest=1",
+                "-t",
+                "3",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                film.to_str().unwrap(),
+            ],
+            120,
+        )
+        .await
+        .unwrap();
+        let samples = detect_video(&dir.join(MODEL_FILE), &film, 0.0, 3.0, 0.5, 1280, 720)
+            .await
+            .unwrap();
+        assert_eq!(samples.len(), 6);
+        for sample in &samples {
+            assert_eq!(sample.faces.len(), 1, "at {}", sample.time);
+            let face = &sample.faces[0];
+            // The face's middle is 298 px into the 480 px portrait, which starts at 100 + 200t.
+            let expected = (100.0 + 200.0 * sample.time + 298.0) / 1280.0;
+            let middle = face.x + face.w / 2.0;
+            assert!(
+                (middle - expected).abs() < 0.04,
+                "at {}: {middle} not {expected}",
+                sample.time
+            );
+        }
+    }
+
+    /// A real face: NASA's portrait of Neil Armstrong (S69-31741, public domain; tests/assets),
+    /// decoded to grey by the app's own ffmpeg, is found where it is.
+    #[tokio::test]
+    async fn the_bundled_detector_finds_a_real_face() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let photo = dir.join("tests/assets/portrait.jpg");
+        let (width, height) = (400u32, 500u32);
+        let grey = media::run(
+            "ffmpeg",
+            &[
+                "-v",
+                "error",
+                "-i",
+                photo.to_str().unwrap(),
+                "-vf",
+                &format!("scale={width}:{height},format=gray"),
+                "-f",
+                "rawvideo",
+                "-",
+            ],
+            60,
+        )
+        .await
+        .unwrap();
+        // The same frame twice, as two samples half a second apart.
+        let frames = [grey.clone(), grey].concat();
+        let samples = detect_grey(&dir.join(MODEL_FILE), &frames, width, height, 3.0, 0.5).unwrap();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[1].time, 3.5);
+        let face = &samples[0].faces;
+        assert_eq!(face.len(), 1, "one face");
+        let (cx, cy) = (face[0].x + face[0].w / 2.0, face[0].y + face[0].h / 2.0);
+        // His face is right of centre, a quarter of the way down.
+        assert!((0.55..0.70).contains(&cx), "{cx}");
+        assert!((0.17..0.34).contains(&cy), "{cy}");
+        assert!((0.12..0.35).contains(&face[0].w), "{}", face[0].w);
+        // A frame with no one in it has no faces.
+        let blank = vec![128u8; (width * height) as usize];
+        let none = detect_grey(&dir.join(MODEL_FILE), &blank, width, height, 0.0, 1.0).unwrap();
+        assert!(none[0].faces.is_empty());
+    }
 
     #[test]
     fn face_samples_stay_sparse_on_a_long_clip() {

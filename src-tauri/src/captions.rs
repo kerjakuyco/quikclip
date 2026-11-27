@@ -33,6 +33,8 @@ pub enum Style {
     Bold,
     Karaoke,
     Pop,
+    /// Clean's lines, each on a dark box, as broadcast subtitles are.
+    Boxed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +56,25 @@ pub struct Captions {
     pub top: Option<f64>,
     /// The transcript's language, which picks the regional face for Han text.
     pub language: Option<String>,
+    /// The size against the style's own, 0.7–1.5.
+    pub scale: f64,
+    /// How far top and bottom captions move toward the middle, as a share of the frame's height (negative: to the edge).
+    pub lift: f64,
+    /// Words lit up wherever they are said: bare and lower case (see `bare`).
+    pub keywords: Vec<String>,
+    /// The face for Latin, Cyrillic and other text the bundled faces cover.
+    pub face: &'static Face,
+}
+
+pub const MIN_SCALE: f64 = 0.7;
+pub const MAX_SCALE: f64 = 1.5;
+pub const MAX_LIFT: f64 = 0.3;
+pub const MAX_KEYWORDS: usize = 24;
+
+/// A word compared without case or the punctuation around it (src/captions.ts bareWord).
+pub fn bare(word: &str) -> String {
+    word.trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase()
 }
 
 #[derive(Deserialize)]
@@ -71,6 +92,14 @@ struct Request {
     top: Option<f64>,
     #[serde(default)]
     language: Option<String>,
+    #[serde(default)]
+    scale: Option<f64>,
+    #[serde(default)]
+    lift: Option<f64>,
+    #[serde(default)]
+    keywords: Vec<String>,
+    #[serde(default)]
+    font: String,
 }
 
 /// Quikclip's twelve caption colours (src/captions.ts CAPTION_COLORS): the studio's own ember, sage and graphite with
@@ -84,7 +113,69 @@ const HIGHLIGHT_COLOR: &str = "#FF8057";
 const POP_INK: &str = "#141414";
 /// The bundled face (public/fonts, SIL OFL), loaded by libass from the ffmpeg run's own folder.
 pub const FONT: &str = "Noto Sans";
-pub const FONT_FILES: [&str; 2] = ["NotoSans-Regular.ttf", "NotoSans-Bold.ttf"];
+/// Every bundled caption face's files (public/fonts, SIL OFL), copied into each run's folder.
+pub const FONT_FILES: [&str; 8] = [
+    "NotoSans-Regular.ttf",
+    "NotoSans-Bold.ttf",
+    "Montserrat-Regular.ttf",
+    "Montserrat-Black.ttf",
+    "Poppins-Regular.ttf",
+    "Poppins-Bold.ttf",
+    "BebasNeue-Regular.ttf",
+    "Anton-Regular.ttf",
+];
+
+/// A caption face (src/captions.ts CAPTION_FONTS): the families libass is asked for at the two weights, whether bold
+/// text asks for bold (a face whose heavy weight is a family of its own, or that has one weight, is never emboldened),
+/// and its size against Noto Sans's, so every face reads about as large.
+#[derive(Debug, PartialEq)]
+pub struct Face {
+    pub id: &'static str,
+    pub regular: &'static str,
+    pub bold: &'static str,
+    pub bold_flag: bool,
+    pub scale: f64,
+}
+pub const FACES: [Face; 5] = [
+    Face {
+        id: "noto",
+        regular: "Noto Sans",
+        bold: "Noto Sans",
+        bold_flag: true,
+        scale: 1.0,
+    },
+    Face {
+        id: "montserrat",
+        regular: "Montserrat",
+        bold: "Montserrat Black",
+        bold_flag: false,
+        scale: 0.92,
+    },
+    Face {
+        id: "poppins",
+        regular: "Poppins",
+        bold: "Poppins",
+        bold_flag: true,
+        scale: 0.94,
+    },
+    Face {
+        id: "bebas",
+        regular: "Bebas Neue",
+        bold: "Bebas Neue",
+        bold_flag: false,
+        scale: 1.24,
+    },
+    Face {
+        id: "anton",
+        regular: "Anton",
+        bold: "Anton",
+        bold_flag: false,
+        scale: 1.0,
+    },
+];
+pub fn face(id: &str) -> &'static Face {
+    FACES.iter().find(|f| f.id == id).unwrap_or(&FACES[0])
+}
 const MAX_LINE: usize = 32;
 const MAX_CUES: usize = 5000;
 // Pacing (clip-ai CAPTION_*): word times land on or after a word's onset and people read ahead.
@@ -128,6 +219,7 @@ pub fn parse(json: &str) -> Result<Option<Captions>> {
         "bold" => Style::Bold,
         "karaoke" => Style::Karaoke,
         "pop" => Style::Pop,
+        "boxed" => Style::Boxed,
         "none" => return Ok(None),
         _ => return Err("Unknown caption style.".into()),
     };
@@ -172,6 +264,27 @@ pub fn parse(json: &str) -> Result<Option<Captions>> {
         highlight: known(&request.highlight, HIGHLIGHT_COLOR),
         top: request.top.filter(|t| t.is_finite() && *t >= 0.0),
         language: request.language.map(|l| l.chars().take(32).collect()),
+        scale: request
+            .scale
+            .filter(|s| s.is_finite())
+            .unwrap_or(1.0)
+            .clamp(MIN_SCALE, MAX_SCALE),
+        lift: request
+            .lift
+            .filter(|l| l.is_finite())
+            .unwrap_or(0.0)
+            .clamp(-MAX_LIFT, MAX_LIFT),
+        keywords: {
+            let mut words: Vec<String> = Vec::new();
+            for word in request.keywords.iter().map(|w| bare(w)) {
+                if !word.is_empty() && word.chars().count() <= 64 && !words.contains(&word) {
+                    words.push(word);
+                }
+            }
+            words.truncate(MAX_KEYWORDS);
+            words
+        },
+        face: face(&request.font),
     }))
 }
 
@@ -549,8 +662,24 @@ fn pop_groups(words: &[Word]) -> Vec<Vec<Word>> {
     groups
 }
 
-fn style_events(cue: &Paced, style: Style, size: i64, text: &str, high: &str) -> Vec<String> {
+fn style_events(
+    cue: &Paced,
+    style: Style,
+    size: i64,
+    text: &str,
+    high: &str,
+    keywords: &[String],
+) -> Vec<String> {
     let (start, end) = (cue.start, cue.end);
+    let key = |t: &str| !keywords.is_empty() && keywords.contains(&bare(t));
+    // A keyword in the highlight, a little larger; on Karaoke, whose sweep is the highlight, only larger.
+    let lit_key = |t: String| {
+        if style == Style::Karaoke {
+            format!("{{\\fscx112\\fscy112}}{t}{{\\fscx100\\fscy100}}")
+        } else {
+            format!("{{\\c{high}\\fscx112\\fscy112}}{t}{{\\c{text}\\fscx100\\fscy100}}")
+        }
+    };
     let words: Vec<Word> = cue
         .words
         .iter()
@@ -568,9 +697,9 @@ fn style_events(cue: &Paced, style: Style, size: i64, text: &str, high: &str) ->
     if texts.is_empty() || end <= start {
         return vec![];
     }
-    let plain = |_: usize, t: String| t;
+    let plain = |i: usize, t: String| if key(&texts[i]) { lit_key(t) } else { t };
     match style {
-        Style::Clean => vec![dialogue(
+        Style::Clean | Style::Boxed => vec![dialogue(
             0,
             start,
             end,
@@ -597,7 +726,7 @@ fn style_events(cue: &Paced, style: Style, size: i64, text: &str, high: &str) ->
                         if j == i {
                             format!("{{\\c{high}}}{t}{{\\c{text}}}")
                         } else {
-                            t
+                            plain(j, t)
                         }
                     };
                     dialogue(
@@ -634,7 +763,7 @@ fn style_events(cue: &Paced, style: Style, size: i64, text: &str, high: &str) ->
                 } else {
                     String::new()
                 };
-                format!("{pause}{{\\kf{sung}}}{t}")
+                format!("{pause}{{\\kf{sung}}}{}", plain(j, t))
             };
             vec![dialogue(
                 0,
@@ -661,6 +790,7 @@ fn style_events(cue: &Paced, style: Style, size: i64, text: &str, high: &str) ->
                 beats.extend(group[1..].iter().map(|w| w.start.max(first).min(last)));
                 beats.push(last);
                 let texts: Vec<String> = group.iter().map(|w| w.text.clone()).collect();
+                let plain = |j: usize, t: String| if key(&texts[j]) { lit_key(t) } else { t };
                 for i in 0..group.len() {
                     if beats[i + 1] <= beats[i] {
                         continue;
@@ -710,7 +840,13 @@ const TRANSLATION_SCALE: f64 = 0.62;
 /// A cue's translation as the end of its caption text (clip-ai _translation): a smaller, plain block under the line in the
 /// caption colour, so it moves with the captions wherever they sit. On Pop's box layer it inherits the hidden alpha; on
 /// karaoke it is a syllable of its own, sung at once, so the last word's sweep doesn't stretch across it.
-fn translation_block(cue: &Paced, size: i64, colour: &str, karaoke: bool) -> String {
+fn translation_block(
+    cue: &Paced,
+    size: i64,
+    colour: &str,
+    karaoke: bool,
+    regular: Option<&str>,
+) -> String {
     let Some(text) = cue.translation.as_deref().filter(|t| !t.trim().is_empty()) else {
         return String::new();
     };
@@ -721,8 +857,11 @@ fn translation_block(cue: &Paced, size: i64, colour: &str, karaoke: bool) -> Str
         .into_iter()
         .map(|(a, b)| ass_text(&join_words(&parts[a..b])))
         .collect();
+    let face = regular
+        .map(|name| format!("\\fn{name}"))
+        .unwrap_or_default();
     format!(
-        "{}\\N{{\\fs{small}\\b0\\bord{}\\shad0\\c{colour}}}{}",
+        "{}\\N{{{face}\\fs{small}\\b0\\bord{}\\shad0\\c{colour}}}{}",
         if karaoke { "{\\k0}" } else { "" },
         ((small as f64 * 0.08).round() as i64).max(1),
         lines.join("\\N")
@@ -732,13 +871,13 @@ fn translation_block(cue: &Paced, size: i64, colour: &str, karaoke: bool) -> Str
 /// ASS font size at a 1080 px short side (clip-ai CAPTION_SIZES), and the bottom margin and Top start as shares of height.
 fn caption_size(width: u32, height: u32, style: Style) -> f64 {
     let base = match (height.cmp(&width), style) {
-        (std::cmp::Ordering::Greater, Style::Clean) => 66.0,
+        (std::cmp::Ordering::Greater, Style::Clean | Style::Boxed) => 66.0,
         (std::cmp::Ordering::Greater, Style::Pop) => 104.0,
         (std::cmp::Ordering::Greater, _) => 70.0,
-        (std::cmp::Ordering::Equal, Style::Clean) => 62.0,
+        (std::cmp::Ordering::Equal, Style::Clean | Style::Boxed) => 62.0,
         (std::cmp::Ordering::Equal, Style::Pop) => 96.0,
         (std::cmp::Ordering::Equal, _) => 66.0,
-        (std::cmp::Ordering::Less, Style::Clean) => 62.0,
+        (std::cmp::Ordering::Less, Style::Clean | Style::Boxed) => 62.0,
         (std::cmp::Ordering::Less, Style::Pop) => 90.0,
         (std::cmp::Ordering::Less, _) => 66.0,
     };
@@ -844,37 +983,66 @@ pub fn to_srt(cues: &[Paced]) -> String {
 
 pub fn to_ass(cues: &[Paced], width: u32, height: u32, captions: &Captions) -> String {
     let style = captions.style;
-    let size = caption_size(width, height, style).round() as i64;
+    let all: String = cues
+        .iter()
+        .flat_map(|c| c.words.iter().map(|w| w.text.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // Korean, Japanese and Chinese take the platform's regional face; everything else the clip's own.
+    let regional = caption_font(&all, captions.language.as_deref());
+    let own = (regional == FONT).then_some(captions.face);
+    let size = (caption_size(width, height, style)
+        * captions.scale
+        * own.map(|face| face.scale).unwrap_or(1.0))
+    .round() as i64;
     let side = (width as f64 * 0.06).round() as i64;
+    let lift = (captions.lift * height as f64).round() as i64;
     let (text, high) = (captions.color, captions.highlight);
     let edge = if is_dark(text) { "#FFFFFF" } else { "#000000" };
     let (alignment, margin) = match captions.position {
         Position::Middle => (5, 0),
         Position::Top => (
             8,
-            captions
+            (captions
                 .top
                 .unwrap_or(height as f64 * caption_top(width, height))
-                .round() as i64,
+                .round() as i64
+                + lift)
+                .max(0),
         ),
         Position::Bottom => (
             2,
-            (height as f64 * caption_margin(width, height, style == Style::Pop)).round() as i64,
+            ((height as f64 * caption_margin(width, height, style == Style::Pop)).round() as i64
+                + lift)
+                .max(0),
         ),
     };
     let px = |share: f64| ((size as f64 * share).round() as i64).max(1);
-    let all: String = cues
-        .iter()
-        .flat_map(|c| c.words.iter().map(|w| w.text.as_str()))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let font = caption_font(&all, captions.language.as_deref());
     let line = |name: &str, colours: String, bold: i8, border: u8, outline: i64, shadow: i64| {
+        let (font, bold) = match own {
+            None => (regional, bold),
+            Some(face) if bold != 0 => (face.bold, if face.bold_flag { -1 } else { 0 }),
+            Some(face) => (face.regular, 0),
+        };
         format!("Style: {name},{font},{size},{colours},{bold},0,0,0,100,100,0,0,{border},{outline},{shadow},{alignment},{side},{side},{margin},1")
     };
     let c = |color: &str| ass_colour(color, 0);
     let ink = if is_dark(high) { "#FFFFFF" } else { POP_INK };
     let styles = match style {
+        // The box is the outline colour of border style 3, padded by the outline width.
+        Style::Boxed => vec![line(
+            "Caption",
+            format!(
+                "{},{},{},&H80000000",
+                c(text),
+                c(text),
+                ass_colour(if is_dark(text) { "#FFFFFF" } else { "#101010" }, 0x50)
+            ),
+            0,
+            3,
+            px(0.22),
+            0,
+        )],
         Style::Clean => vec![line(
             "Caption",
             format!(
@@ -929,10 +1097,25 @@ pub fn to_ass(cues: &[Paced], width: u32, height: u32, captions: &Captions) -> S
     let events: Vec<String> = cues
         .iter()
         .flat_map(|cue| {
-            let after = translation_block(cue, size, &text_inline, style == Style::Karaoke);
-            style_events(cue, style, size, &text_inline, &high_inline)
-                .into_iter()
-                .map(move |event| event + &after)
+            let after = translation_block(
+                cue,
+                size,
+                &text_inline,
+                style == Style::Karaoke,
+                // A face whose heavy weight is a family of its own goes back to its regular family.
+                own.filter(|face| face.regular != face.bold)
+                    .map(|face| face.regular),
+            );
+            style_events(
+                cue,
+                style,
+                size,
+                &text_inline,
+                &high_inline,
+                &captions.keywords,
+            )
+            .into_iter()
+            .map(move |event| event + &after)
         })
         .collect();
     let mut script = format!(
@@ -1061,7 +1244,75 @@ mod tests {
             highlight: HIGHLIGHT_COLOR,
             top: None,
             language: None,
+            scale: 1.0,
+            lift: 0.0,
+            keywords: vec![],
+            face: &FACES[0],
         }
+    }
+
+    #[test]
+    fn each_face_is_asked_for_by_its_own_family_and_weight() {
+        let paced = pace_cues(
+            &[cue(vec![w(0.0, 1.0, "Hello"), w(1.0, 2.0, "there")])],
+            Some(2.0),
+        );
+        let mut bold = look(Style::Bold);
+        bold.face = face("montserrat");
+        // Montserrat's heavy weight is a family of its own, asked for without emboldening, a little smaller.
+        assert!(to_ass(&paced, 1080, 1920, &bold).contains("Style: Caption,Montserrat Black,64,"));
+        assert!(to_ass(&paced, 1080, 1920, &bold).contains(",0,0,0,0,100,100,"));
+        let mut clean = look(Style::Clean);
+        clean.face = face("poppins");
+        assert!(to_ass(&paced, 1080, 1920, &clean).contains("Style: Caption,Poppins,62,"));
+        let mut pop = look(Style::Pop);
+        pop.face = face("bebas");
+        let script = to_ass(&paced, 1080, 1920, &pop);
+        assert!(script.contains("Style: Pop,Bebas Neue,129,"), "{script}");
+        assert!(script.contains("Style: PopBox,Bebas Neue,129,"));
+        let mut poppins_bold = look(Style::Bold);
+        poppins_bold.face = face("poppins");
+        assert!(to_ass(&paced, 1080, 1920, &poppins_bold).contains(",-1,0,0,0,100,100,"));
+        // Unknown faces are Noto Sans; Korean keeps the platform's face whatever the clip's is.
+        assert_eq!(face("comic"), &FACES[0]);
+        let korean = pace_cues(&[cue(vec![w(0.0, 1.0, "안녕하세요")])], Some(1.0));
+        assert!(!to_ass(&korean, 1080, 1920, &bold).contains("Montserrat"));
+        let parsed = parse(r#"{"cues":[],"style":"clean","font":"anton"}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.face.regular, "Anton");
+    }
+
+    #[test]
+    fn keywords_light_up_and_size_and_lift_move_the_captions() {
+        let paced = pace_cues(
+            &[cue(vec![
+                w(0.0, 0.4, "Climb"),
+                w(0.4, 0.8, "Denali,"),
+                w(0.8, 1.2, "now"),
+            ])],
+            Some(2.0),
+        );
+        let mut look_ = look(Style::Clean);
+        look_.keywords = vec!["denali".into()];
+        let clean = to_ass(&paced, 1080, 1920, &look_);
+        assert!(clean.contains(
+            "Climb {\\c&H5780FF&\\fscx112\\fscy112}Denali,{\\c&HFFFFFF&\\fscx100\\fscy100} now"
+        ));
+        look_.style = Style::Karaoke;
+        assert!(to_ass(&paced, 1080, 1920, &look_).contains("{\\fscx112\\fscy112}Denali,"));
+        let mut boxed = look(Style::Boxed);
+        boxed.scale = 1.5;
+        boxed.lift = 0.1;
+        let script = to_ass(&paced, 1080, 1920, &boxed);
+        // 66 px at 1.5×, on a box (border style 3), 0.24 + 0.1 of the height up from the bottom.
+        assert!(script.contains("Style: Caption,Noto Sans,99,"), "{script}");
+        assert!(script.contains(",0,3,22,0,2,65,65,653,1"), "{script}");
+        let parsed = parse(r#"{"cues":[],"style":"boxed","scale":9,"lift":-2,"keywords":["Denali!","denali","",""]}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!((parsed.scale, parsed.lift), (MAX_SCALE, -MAX_LIFT));
+        assert_eq!(parsed.keywords, ["denali"]);
     }
 
     #[test]

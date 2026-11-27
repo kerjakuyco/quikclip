@@ -409,6 +409,7 @@ mod tests {
                 port: None,
                 account_id: Some("a".repeat(32)),
                 gateway: None,
+                model: None,
             },
             Some("fixture-token"),
         )
@@ -460,6 +461,91 @@ mod tests {
         assert_eq!(asked.load(Ordering::SeqCst), 2);
     }
 
+    /// A 31-minute recording goes to a Whisper server on this computer in four ten-minute parts,
+    /// each an OpenAI-style upload, and its words come back on the recording's own clock.
+    #[tokio::test]
+    async fn a_long_recording_is_transcribed_in_ten_minute_parts_on_a_local_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("long");
+        std::fs::create_dir_all(&folder).unwrap();
+        run(
+            "ffmpeg",
+            &[
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x36:r=1:d=1860",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=f=300:r=8000:d=1860",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "16k",
+                "-shortest",
+                text(&folder.join("source.mp4")).unwrap(),
+            ],
+            300,
+        )
+        .await
+        .unwrap();
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr());
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = asked.clone();
+        std::thread::spawn(move || {
+            for mut request in server.incoming_requests() {
+                assert_eq!(request.url(), "/v1/audio/transcriptions");
+                let mut body = Vec::new();
+                request.as_reader().read_to_end(&mut body).unwrap();
+                assert!(String::from_utf8_lossy(&body).contains("filename=\"audio.mp3\""));
+                counter.fetch_add(1, Ordering::SeqCst);
+                let answer = serde_json::json!({"language":"english","text":"Part.",
+                    "segments":[{"start":1.0,"end":1.5,"text":"Part."}],
+                    "words":[{"word":"Part.","start":1.0,"end":1.5}]});
+                request
+                    .respond(Response::from_string(answer.to_string()))
+                    .unwrap();
+            }
+        });
+        let session = Session::new(
+            Connection {
+                provider: Provider::Whisper,
+                port: Some(9),
+                account_id: None,
+                gateway: None,
+                model: None,
+            },
+            None,
+        )
+        .await
+        .unwrap()
+        .with_base(base);
+        let seen = Mutex::new(Vec::new());
+        let transcript = transcribe_into(
+            &folder,
+            "long",
+            &session,
+            PART_SECONDS,
+            None,
+            |done, total| seen.lock().unwrap().push((done, total)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(asked.load(Ordering::SeqCst), 4);
+        assert_eq!(seen.lock().unwrap().last(), Some(&(4, 4)));
+        let starts: Vec<f64> = transcript.words.iter().map(|w| w.start).collect();
+        assert_eq!(starts, vec![1.0, 601.0, 1201.0, 1801.0]);
+        assert_eq!(transcript.segments.len(), 4);
+    }
+
     #[tokio::test]
     async fn a_silent_video_keeps_an_empty_transcript_and_a_deleted_one_stops() {
         let tmp = tempfile::tempdir().unwrap();
@@ -488,6 +574,7 @@ mod tests {
                 port: None,
                 account_id: Some("a".repeat(32)),
                 gateway: None,
+                model: None,
             },
             Some("fixture-token"),
         )
