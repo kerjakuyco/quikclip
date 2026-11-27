@@ -2781,6 +2781,7 @@ export default function App() {
       )}
       {modal && (
         <Dialog
+          wide={modal === 'ai' && !!moments}
           eyebrow={modal === 'ai' ? 'AI connections' : 'Quikclip Studio'}
           title={
             {
@@ -2944,7 +2945,13 @@ export default function App() {
           )}
           {modal === 'ai' &&
             (moments ? (
-              <Moments moments={moments} add={addMoments} back={() => setMoments(null)} />
+              <Moments
+                moments={moments}
+                video={src || undefined}
+                poster={(start, end) => frame(m, (start + end) / 2)}
+                add={addMoments}
+                back={() => setMoments(null)}
+              />
             ) : (
               <ProviderPanel busy={!!busy} analyze={analyze} />
             ))}

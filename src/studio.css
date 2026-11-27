@@ -3745,6 +3745,9 @@ kbd {
   border-radius: var(--panel-radius);
   box-shadow: var(--overlay-shadow);
 }
+.dialog.dialog-wide {
+  width: min(760px, calc(100% - 28px));
+}
 .dialog::backdrop {
   background: oklch(12% 0.016 256 / 0.73);
 }
@@ -5690,24 +5693,105 @@ kbd {
 }
 .highlight-options {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px 12px;
-  padding-block: 8px;
+  gap: 14px;
+  padding-block: 12px 4px;
   border-block: 1px solid var(--line);
 }
-.highlight-count {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+.highlight-field {
+  display: grid;
+  gap: 8px;
 }
-.highlight-length {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+.highlight-field-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 28px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 640;
 }
-.highlight-options button {
-  white-space: nowrap;
+.highlight-field-head .number-field {
+  width: 52px;
+  height: 28px;
+  -moz-appearance: textfield;
+  appearance: textfield;
 }
-@media (max-width: 400px) {
-  .highlight-options {
-    grid-template-columns: minmax(0, 1fr);
-  }
+.highlight-length-now {
+  color: var(--text);
+  font: 650 12px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.highlight-field-head .number-field::-webkit-outer-spin-button,
+.highlight-field-head .number-field::-webkit-inner-spin-button {
+  margin: 0;
+  -webkit-appearance: none;
+}
+.highlight-choices {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 4px;
+  padding: 4px;
+  border-radius: var(--radius);
+  background: var(--well);
+  box-shadow: inset 0 1px var(--sheen);
+}
+.highlight-choices button {
+  position: relative;
+  min-width: 0;
+  min-height: 32px;
+  padding: 0 2px;
+  border-radius: calc(var(--radius) - 2px);
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 680;
+  font-variant-numeric: tabular-nums;
+}
+.highlight-choices button:hover:not(:disabled, .active) {
+  background: var(--hover);
+  color: var(--text);
+}
+.highlight-choices button.active {
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 750;
+}
+.highlight-range {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: end;
+}
+.highlight-range label {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px 8px;
+  align-items: center;
+  color: var(--muted);
+  font-size: 12px;
+}
+.highlight-range label span:first-child {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 640;
+}
+.highlight-range .number-field {
+  width: 100%;
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+.highlight-range .number-field::-webkit-outer-spin-button,
+.highlight-range .number-field::-webkit-inner-spin-button {
+  margin: 0;
+  -webkit-appearance: none;
+}
+.highlight-range-rule {
+  width: 18px;
+  height: 1px;
+  margin-bottom: 14px;
+  background: var(--line-strong);
 }
 .provider-grid {
   display: grid;
@@ -6286,11 +6370,24 @@ kbd {
   line-height: 1.5;
 }
 .score-why {
-  display: block;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
   margin: 0;
   color: var(--muted);
   font-size: 12px;
   line-height: 1.5;
+}
+.score-why p {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+}
+.score-why.clamp p {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 .score-why b {
   color: var(--text);
@@ -6342,119 +6439,405 @@ kbd {
   color: var(--accent-hover);
   background: var(--accent-surface);
 }
-/* Highlight finder's moments, picked before they become clips (components/Moments.tsx). */
+/* Highlight finder contact sheet (components/Moments.tsx).
+   The still is the take: the opening line burns onto the frame, and the score ring sits on the picture. */
 .moments {
   display: grid;
-  gap: 16px;
+  gap: 18px;
 }
-.moments-intro,
-.moments-note {
+.moments-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: 16px;
+  align-items: start;
+}
+.moments-count {
+  margin: 2px 0 0;
+  color: var(--accent);
+  font: 700 56px/0.78 var(--mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.07em;
+}
+.moments-kicker {
   margin: 0;
+  color: var(--accent-hover);
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+.moments-title {
+  margin: 3px 0 0;
+  font-size: 20px;
+  font-weight: 750;
+  letter-spacing: -0.03em;
+  line-height: 1.2;
+}
+.moments-intro {
+  max-width: 46ch;
+  margin: 6px 0 0;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 13px;
   line-height: 1.5;
 }
-.moments-group {
+.moments-list {
   display: grid;
-  gap: 8px;
-}
-.moments-group h3 {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 0;
-  color: var(--text);
-  font-size: 12px;
-  font-weight: 750;
-}
-.moments-group h3 small {
-  padding: 2px 8px;
-  border-radius: 999px;
-  color: var(--muted);
-  background: var(--raised);
-  font: 700 10px/1.4 var(--mono);
-}
-.moments-group ol {
-  display: grid;
-  gap: 8px;
   margin: 0;
   padding: 0;
+  border-top: 1px solid var(--line);
   list-style: none;
 }
 .moment {
   display: grid;
-  gap: 12px;
-  width: 100%;
-  padding: 12px;
-  border-radius: calc(var(--radius) + 2px);
-  background: var(--chrome);
-  box-shadow: inset 0 0 0 1px transparent;
+  grid-template-columns: 36px minmax(156px, 208px) minmax(0, 1fr);
+  gap: 10px 14px;
+  align-items: start;
+  padding: 14px 2px 16px;
+  background: transparent;
+  box-shadow: inset 0 -1px var(--line);
   color: var(--text);
+  cursor: pointer;
   text-align: start;
-  transition:
-    background 0.15s var(--ease),
-    box-shadow 0.15s var(--ease);
+  transition: background-color 0.18s var(--ease);
+}
+.moment:last-child {
+  box-shadow: none;
 }
 .moment:hover {
-  background: var(--raised);
+  background: color-mix(in oklab, var(--raised) 42%, transparent);
 }
-.moment.on {
-  box-shadow: inset 0 0 0 1px var(--accent-line);
-  background: color-mix(in oklab, var(--accent) 6%, var(--chrome));
+.moment-index {
+  padding-top: 4px;
+  color: var(--dim);
+  font: 650 12px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
+}
+.moment.on .moment-index {
+  color: var(--accent-hover);
+}
+.moment-stage {
+  position: relative;
+  min-width: 0;
+  align-self: start;
+}
+.moment-frame {
+  position: relative;
+  display: block;
+  overflow: hidden;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  padding: 0;
+  border-radius: 10px;
+  background: var(--well);
+  box-shadow: inset 0 0 0 1px var(--line);
+  text-align: start;
+}
+.moment.on .moment-frame {
+  box-shadow:
+    inset 0 0 0 2px var(--accent),
+    0 0 0 1px color-mix(in oklab, var(--accent) 50%, transparent),
+    0 10px 28px color-mix(in oklab, var(--accent) 22%, transparent);
+}
+.moment-frame:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -4px;
+}
+.moment-frame img,
+.moment-frame-empty {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.moment-frame::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  background-image: radial-gradient(oklch(96% 0.01 256 / 0.7) 0.55px, transparent 0.7px);
+  background-size: 3px 3px;
+  mix-blend-mode: overlay;
+  opacity: 0.42;
+}
+.moment-length,
+.moment-play,
+.moment-caption {
+  z-index: 2;
+}
+.moment-length {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: oklch(14% 0.016 256 / 0.78);
+  color: var(--text);
+  font: 700 10px/1.4 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.moment-play {
+  position: absolute;
+  top: 46%;
+  left: 50%;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: oklch(14% 0.016 256 / 0.72);
+  box-shadow:
+    inset 0 0 0 1px var(--sheen),
+    0 8px 18px oklch(10% 0.016 256 / 0.45);
+  color: var(--text);
+  transform: translate(-50%, -50%);
+  transition:
+    background-color 0.15s var(--ease),
+    color 0.15s var(--ease),
+    transform 0.15s var(--ease);
+}
+.moment-frame:hover .moment-play,
+.moment-frame:focus-visible .moment-play,
+.moment-frame[aria-pressed='true'] .moment-play {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+.moment-play svg {
+  display: block;
+  fill: currentColor;
+  stroke: none;
+}
+.moment-caption {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: -webkit-box;
+  padding: 28px 10px 8px;
+  overflow: hidden;
+  background: linear-gradient(to top, oklch(12% 0.016 256 / 0.9), transparent);
+  color: var(--text);
+  font-size: 11px;
+  font-style: italic;
+  line-height: 1.35;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.moment-stage:not(:has(.moment-frame)) {
+  min-height: 52px;
+  padding-top: 6px;
+}
+.moment-stage:not(:has(.moment-frame)) .moment-ring {
+  position: static;
+  float: right;
+  margin-left: 10px;
+  transform: none;
+}
+.moment-ring {
+  position: absolute;
+  top: 50%;
+  right: -18px;
+  z-index: 3;
+  display: grid;
+  padding: 4px;
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: 0 8px 18px oklch(12% 0.018 256 / 0.4);
+  transform: translateY(-50%);
+}
+.moment-body {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 2px 0 0 16px;
 }
 .moment-head {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
   gap: 12px;
 }
 .moment-title {
-  display: grid;
-  gap: 4px;
-  min-width: 0;
+  margin: 0;
+  font-size: 16px;
+  font-weight: 750;
+  letter-spacing: -0.02em;
+  line-height: 1.3;
 }
-.moment-title strong {
-  overflow: hidden;
-  font-size: 13px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.moment-facts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  margin: -2px 0 0;
+  color: var(--muted);
+  font: 600 12px/1.3 var(--mono);
+  font-variant-numeric: tabular-nums;
 }
-.moment-title small {
-  color: var(--dim);
-  font: 600 11px/1 var(--mono);
+.moment-chip {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--accent-surface);
+  color: var(--accent-hover);
+  font: 700 10px/1.5 inherit;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.moment-scores .score-parts {
+  width: 100%;
+  gap: 8px 10px;
+}
+.moment-scores .score-parts .score-bar {
+  height: 3px;
 }
 .moment-tick {
   display: grid;
+  flex: none;
   place-items: center;
-  width: 22px;
-  height: 22px;
+  width: 24px;
+  height: 24px;
   border-radius: 50%;
   color: transparent;
   box-shadow: inset 0 0 0 1.5px var(--line-strong);
   transition:
     background 0.15s var(--ease),
-    color 0.15s var(--ease);
+    color 0.15s var(--ease),
+    transform 0.15s var(--ease);
 }
 .moment.on .moment-tick {
   color: var(--accent-ink);
   background: var(--accent);
   box-shadow: none;
 }
+.moment-more {
+  flex: none;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 650;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.moment-player {
+  grid-column: 1 / -1;
+  overflow: hidden;
+  border-radius: 12px;
+  background: var(--well);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.moment-player video {
+  display: block;
+  width: 100%;
+  max-height: 280px;
+  background: var(--well);
+}
+.moment-player-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  color: var(--muted);
+  font: 600 12px/1 var(--mono);
+}
+.moment-player-bar button {
+  color: var(--text);
+  font: 650 12px/1 inherit;
+}
+.moments-more {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  padding: 10px;
+  border-radius: 12px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.moments-more:hover {
+  color: var(--text);
+  background: var(--raised);
+}
+.moments-more svg {
+  transition: transform 0.15s var(--ease);
+}
+.moments-more svg[data-open] {
+  transform: rotate(180deg);
+}
 .moments-actions {
   position: sticky;
   bottom: -24px;
+  z-index: 4;
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   justify-content: space-between;
   gap: 8px;
   margin: 0 -24px -24px;
   padding: 12px 24px 24px;
-  background: var(--surface);
+  background: color-mix(in oklab, var(--surface) 92%, transparent);
   box-shadow: 0 -1px var(--line);
+  backdrop-filter: blur(12px);
 }
-.highlight-label {
-  flex-direction: row;
-  align-items: center;
-  justify-content: space-between;
+.moments-actions-end {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .moment {
+    animation: moment-in 480ms var(--ease) backwards;
+  }
+  .moment:hover {
+    transform: translateY(-2px);
+  }
+  .moment-frame:hover .moment-play {
+    transform: translate(-50%, -50%) scale(1.06);
+  }
+}
+@keyframes moment-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+}
+@media (max-width: 640px) {
+  .moments-count {
+    font-size: 36px;
+  }
+  .moment {
+    grid-template-columns: 1fr;
+    position: relative;
+    padding-left: 34px;
+  }
+  .moment-index {
+    position: absolute;
+    top: 16px;
+    left: 2px;
+  }
+  .moment-body {
+    padding-left: 0;
+  }
+  .moment-ring {
+    top: 8px;
+    right: auto;
+    left: 8px;
+    transform: none;
+  }
+  .moment-scores .score-parts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .moment {
+    animation: none;
+  }
 }
 .number-field {
   width: 64px;
@@ -6466,18 +6849,4 @@ kbd {
   color: var(--text);
   font: 600 12px/1 var(--mono);
   text-align: end;
-}
-.highlight-range {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
-  color: var(--muted);
-  font-size: 12px;
-}
-.highlight-range label {
-  display: flex;
-  align-items: center;
-  gap: 8px;
 }

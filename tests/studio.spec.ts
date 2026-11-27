@@ -1184,19 +1184,20 @@ test('every desktop video is transcribed and its clips get captions and a transc
     .getByRole('button', { name: 'Up to 30 seconds' })
     .click();
   await finder.getByRole('button', { name: 'Analyze source' }).click();
-  // The moments come first, scored, to pick from: the review's pick ticked, the near-miss not.
-  const picked = finder.getByRole('region', { name: 'Picked by the review' });
-  await expect(picked.getByRole('checkbox', { name: /Look under the clouds/ })).toHaveAttribute(
+  // The moments come first, best first: the review's pick ticked, the near-miss not.
+  await expect(finder.getByRole('heading', { name: /2 moments worth a clip/ })).toBeVisible();
+  await expect(finder.getByRole('checkbox', { name: 'Look under the clouds' })).toHaveAttribute(
     'aria-checked',
     'true',
   );
-  await expect(picked).toContainText('Opens with “Look under the clouds…”');
-  await expect(picked).toContainText('Hook90');
-  const also = finder.getByRole('region', { name: 'Also considered' });
-  await expect(also.getByRole('checkbox', { name: /A quieter ridge/ })).toHaveAttribute(
+  await expect(finder).toContainText('Opens with “Look under the clouds…”');
+  await expect(finder).toContainText('Hook');
+  await expect(finder).toContainText('90');
+  await expect(finder.getByRole('checkbox', { name: 'A quieter ridge' })).toHaveAttribute(
     'aria-checked',
     'false',
   );
+  await expect(finder.getByRole('button', { name: 'Watch “Look under the clouds”' })).toBeVisible();
   await finder.getByRole('button', { name: 'Add 1 clip' }).click();
   await expect(finder).toBeHidden();
   await expect(

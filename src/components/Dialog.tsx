@@ -7,12 +7,15 @@ export function Dialog({
   children,
   close,
   busy,
+  wide,
 }: {
   title: string;
   eyebrow: string;
   children: ReactNode;
   close: () => void;
   busy?: boolean;
+  /** Wider sheet, for the moment picker. */
+  wide?: boolean;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   useEffect(() => {
@@ -23,7 +26,7 @@ export function Dialog({
   return (
     <dialog
       ref={ref}
-      className="dialog"
+      className={wide ? 'dialog dialog-wide' : 'dialog'}
       aria-labelledby="dialog-title"
       onCancel={(e) => {
         e.preventDefault();

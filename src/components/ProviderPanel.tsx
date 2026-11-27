@@ -96,6 +96,17 @@ export function suggestionModel(): { connection: Connection; model: string } | n
   return null;
 }
 
+/** A length preset as a clock mark, so 90 seconds reads 1:30 rather than 1.5 min. */
+function lengthMark(seconds: number) {
+  const whole = Math.max(0, Math.round(seconds));
+  return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, '0')}`;
+}
+
+/** The short end of a search. A preset uses 20s, or half the limit when that limit is under 40s. */
+function clipFloor(maxSeconds: number, minSeconds?: number) {
+  return minSeconds ?? Math.min(20, maxSeconds / 2);
+}
+
 const defaults = (provider: Provider): Connection =>
   provider === 'cloudflare'
     ? { provider, gateway: 'default', accountId: '' }
@@ -397,22 +408,23 @@ export function ProviderPanel({
               </button>
             </div>
             <div className="highlight-options">
-              <div>
-                <span className="field-label highlight-label" id="highlight-count-label">
-                  Highlights to find
+              <div className="highlight-field">
+                <div className="highlight-field-head">
+                  <span id="highlight-count-label">Highlights to find</span>
                   <input
                     type="number"
                     className="number-field"
                     aria-label="Highlights to find"
+                    title="Type any count from 1 to 20"
                     min={1}
                     max={MAX_HIGHLIGHTS}
                     value={options.count}
                     disabled={disabled}
                     onChange={(e) => configure({ count: Number(e.target.value) })}
                   />
-                </span>
+                </div>
                 <div
-                  className="format-options highlight-count"
+                  className="highlight-choices"
                   role="group"
                   aria-labelledby="highlight-count-label"
                 >
@@ -430,12 +442,16 @@ export function ProviderPanel({
                   ))}
                 </div>
               </div>
-              <div>
-                <span className="field-label" id="highlight-length-label">
-                  Clip length
-                </span>
+              <div className="highlight-field">
+                <div className="highlight-field-head">
+                  <span id="highlight-length-label">Clip length</span>
+                  <span className="highlight-length-now">
+                    {lengthMark(clipFloor(options.maxSeconds, options.minSeconds))}–
+                    {lengthMark(options.maxSeconds)}
+                  </span>
+                </div>
                 <div
-                  className="format-options highlight-length"
+                  className="highlight-choices"
                   role="group"
                   aria-labelledby="highlight-length-label"
                 >
@@ -454,7 +470,7 @@ export function ProviderPanel({
                           configure({ maxSeconds, minSeconds: undefined });
                         }}
                       >
-                        {maxSeconds < 60 ? `${maxSeconds} s` : `${maxSeconds / 60} min`}
+                        {lengthMark(maxSeconds)}
                       </button>
                     );
                   })}
@@ -473,10 +489,14 @@ export function ProviderPanel({
                     Custom
                   </button>
                 </div>
+                <p className="subnote">
+                  Finds clips from {lengthMark(clipFloor(options.maxSeconds, options.minSeconds))}{' '}
+                  to {lengthMark(options.maxSeconds)}, not one exact length.
+                </p>
                 {custom && (
                   <div className="highlight-range" role="group" aria-label="Clip length range">
                     <label>
-                      <span>From</span>
+                      <span>Shortest</span>
                       <input
                         type="number"
                         className="number-field"
@@ -487,9 +507,11 @@ export function ProviderPanel({
                         disabled={disabled}
                         onChange={(e) => configure({ minSeconds: Number(e.target.value) })}
                       />
+                      <span>s</span>
                     </label>
+                    <span className="highlight-range-rule" aria-hidden="true" />
                     <label>
-                      <span>to</span>
+                      <span>Longest</span>
                       <input
                         type="number"
                         className="number-field"
@@ -500,7 +522,7 @@ export function ProviderPanel({
                         disabled={disabled}
                         onChange={(e) => configure({ maxSeconds: Number(e.target.value) })}
                       />
-                      <span>seconds</span>
+                      <span>s</span>
                     </label>
                   </div>
                 )}
