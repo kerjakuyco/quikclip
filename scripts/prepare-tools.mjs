@@ -2,7 +2,7 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { chmod, mkdir, mkdtemp, readFile, rename, rm } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rename, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -66,10 +66,20 @@ const tar =
   process.platform === 'win32'
     ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe')
     : 'tar';
+// GitHub's Windows runner keeps TEMP on C: and the checkout on D:. rename() cannot cross drives.
+async function place(from, to) {
+  try {
+    await rename(from, to);
+  } catch (error) {
+    if (error?.code !== 'EXDEV') throw error;
+    await copyFile(from, to);
+    await rm(from, { force: true });
+  }
+}
 async function extract(file, member, output) {
   const dir = await mkdtemp(path.join(scratch, 'x-'));
   execFileSync(tar, ['-xf', file, '-C', dir, member], { stdio: 'inherit' });
-  await rename(path.join(dir, ...member.split('/')), output);
+  await place(path.join(dir, ...member.split('/')), output);
 }
 try {
   for (const [tool, entry] of Object.entries(lock[target])) {
@@ -90,7 +100,7 @@ try {
       else download(url, temp);
       if ((await digest(temp)) !== want) throw Error(`Integrity check failed for ${tool}.`);
       if (!notice) await chmod(temp, 0o755);
-      await rename(temp, output);
+      await place(temp, output);
     } finally {
       await rm(temp, { force: true });
     }

@@ -59,8 +59,10 @@ pub fn join_graph(
     let mut lines = Vec::new();
     for (i, part) in parts.iter().enumerate() {
         let d = part.duration;
+        // fps and a matching timebase go last. FFmpeg 7's xfade reads the frame rate after
+        // setpts and rejects 0/1, which is what the pinned Linux build does when fps comes earlier.
         lines.push(format!(
-            "[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease:flags=lanczos,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={RATE},format=yuv420p,trim=duration={d:.3},settb=AVTB,setpts=PTS-STARTPTS[v{i}]"
+            "[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease:flags=lanczos,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p,trim=duration={d:.3},setpts=PTS-STARTPTS,fps={RATE},settb=1/{RATE}[v{i}]"
         ));
         lines.push(if part.audio {
             format!(
