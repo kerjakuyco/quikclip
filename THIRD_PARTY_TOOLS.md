@@ -10,6 +10,14 @@ Quikclip distributes the following unmodified standalone programs. Exact downloa
 
 Captions are set in Noto Sans Regular and Bold (`public/fonts`, from [notofonts.github.io at d14cc17](https://github.com/notofonts/notofonts.github.io/tree/d14cc173a70dc57962ed2d4ad278fc9df83bf9f3/fonts/NotoSans/hinted/ttf)), unmodified. Copyright 2022 The Noto Project Authors. The license text accompanies the fonts in `fonts/OFL.txt`.
 
+## Caption faces — SIL Open Font License 1.1
+
+Captions can also be set in Montserrat Regular and Black ([JulietaUla/Montserrat](https://github.com/JulietaUla/Montserrat)), Poppins Regular and Bold, Bebas Neue, and Anton (from [google/fonts](https://github.com/google/fonts/tree/main/ofl)), unmodified, in `public/fonts`. Each is © its project's authors; the license texts accompany them in `fonts/licenses/`.
+
+## SeetaFace Detection model — BSD 2-Clause License
+
+Face tracking on macOS and Linux, and on Windows PCs without the system face detector, uses SeetaFace Detection's frontal face model (`models/seeta_fd_frontal_v1.0.bin`) through the [rustface](https://github.com/atomashpolskiy/rustface) port of the [SeetaFace Engine](https://github.com/seetaface/SeetaFaceEngine), unmodified. Copyright (c) 2016, Visual Information Processing and Learning (VIPL) group, Institute of Computing Technology, Chinese Academy of Sciences. The license text accompanies the model in `models/LICENSE-SeetaFace.txt`.
+
 ## QuickJS-NG — MIT License
 
 ```text
