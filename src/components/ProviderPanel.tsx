@@ -6,6 +6,10 @@ import { desktop, errorText, readSaved } from '../studio';
 import {
   HIGHLIGHT_COUNTS,
   HIGHLIGHT_LENGTHS,
+  LONGEST_CLIP,
+  MAX_HIGHLIGHTS,
+  SHORTEST_CLIP,
+  cleanHighlightOptions,
   loadHighlightOptions,
   rememberHighlightOptions,
   type HighlightOptions,
@@ -117,8 +121,14 @@ export function ProviderPanel({
     [working, setWorking] = useState(false),
     [problem, setProblem] = useState('');
   const disabled = busy || working || !desktop;
+  // A length range of your own, instead of a preset limit.
+  const [custom, setCustom] = useState(
+    () =>
+      options.minSeconds !== undefined ||
+      !(HIGHLIGHT_LENGTHS as readonly number[]).includes(options.maxSeconds),
+  );
   function configure(patch: Partial<HighlightOptions>) {
-    const next = { ...options, ...patch };
+    const next = cleanHighlightOptions({ ...options, ...patch });
     setOptions(next);
     rememberHighlightOptions(next);
   }
@@ -388,8 +398,18 @@ export function ProviderPanel({
             </div>
             <div className="highlight-options">
               <div>
-                <span className="field-label" id="highlight-count-label">
-                  Maximum highlights
+                <span className="field-label highlight-label" id="highlight-count-label">
+                  Highlights to find
+                  <input
+                    type="number"
+                    className="number-field"
+                    aria-label="Highlights to find"
+                    min={1}
+                    max={MAX_HIGHLIGHTS}
+                    value={options.count}
+                    disabled={disabled}
+                    onChange={(e) => configure({ count: Number(e.target.value) })}
+                  />
                 </span>
                 <div
                   className="format-options highlight-count"
@@ -412,31 +432,85 @@ export function ProviderPanel({
               </div>
               <div>
                 <span className="field-label" id="highlight-length-label">
-                  Maximum clip length
+                  Clip length
                 </span>
                 <div
                   className="format-options highlight-length"
                   role="group"
                   aria-labelledby="highlight-length-label"
                 >
-                  {HIGHLIGHT_LENGTHS.map((maxSeconds) => (
-                    <button
-                      key={maxSeconds}
-                      type="button"
-                      disabled={disabled}
-                      className={options.maxSeconds === maxSeconds ? 'active' : ''}
-                      aria-pressed={options.maxSeconds === maxSeconds}
-                      onClick={() => configure({ maxSeconds })}
-                    >
-                      {maxSeconds} s
-                    </button>
-                  ))}
+                  {HIGHLIGHT_LENGTHS.map((maxSeconds) => {
+                    const on = !custom && options.maxSeconds === maxSeconds;
+                    return (
+                      <button
+                        key={maxSeconds}
+                        type="button"
+                        disabled={disabled}
+                        className={on ? 'active' : ''}
+                        aria-pressed={on}
+                        aria-label={`Up to ${maxSeconds} seconds`}
+                        onClick={() => {
+                          setCustom(false);
+                          configure({ maxSeconds, minSeconds: undefined });
+                        }}
+                      >
+                        {maxSeconds < 60 ? `${maxSeconds} s` : `${maxSeconds / 60} min`}
+                      </button>
+                    );
+                  })}
+                  <button
+                    type="button"
+                    disabled={disabled}
+                    className={custom ? 'active' : ''}
+                    aria-pressed={custom}
+                    onClick={() => {
+                      setCustom(true);
+                      configure({
+                        minSeconds: options.minSeconds ?? Math.min(20, options.maxSeconds / 2),
+                      });
+                    }}
+                  >
+                    Custom
+                  </button>
                 </div>
+                {custom && (
+                  <div className="highlight-range" role="group" aria-label="Clip length range">
+                    <label>
+                      <span>From</span>
+                      <input
+                        type="number"
+                        className="number-field"
+                        aria-label="Shortest clip, in seconds"
+                        min={SHORTEST_CLIP}
+                        max={options.maxSeconds - SHORTEST_CLIP}
+                        value={options.minSeconds ?? 20}
+                        disabled={disabled}
+                        onChange={(e) => configure({ minSeconds: Number(e.target.value) })}
+                      />
+                    </label>
+                    <label>
+                      <span>to</span>
+                      <input
+                        type="number"
+                        className="number-field"
+                        aria-label="Longest clip, in seconds"
+                        min={SHORTEST_CLIP * 2}
+                        max={LONGEST_CLIP}
+                        value={options.maxSeconds}
+                        disabled={disabled}
+                        onChange={(e) => configure({ maxSeconds: Number(e.target.value) })}
+                      />
+                      <span>seconds</span>
+                    </label>
+                  </div>
+                )}
               </div>
             </div>
             <p className="subnote">
               Analysis sends the transcript when available, otherwise nine sampled frames and
               timestamps, to {meta.label}. Your original video stays on this device.
+              {options.count > 8 &&
+                ' Many highlights are found a part of the video at a time, so a search takes longer.'}
             </p>
             {!profile.model && (
               <p className="subnote">

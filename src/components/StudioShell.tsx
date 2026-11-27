@@ -59,6 +59,7 @@ export function StudioShell({
   history,
   onShortcuts,
   onCommands,
+  queue,
   onGuide,
   notice,
   children,
@@ -78,6 +79,8 @@ export function StudioShell({
   onShortcuts: () => void;
   /** Opens the command palette (Ctrl+K). */
   onCommands: () => void;
+  /** The render queue, in the status bar. */
+  queue?: ReactNode;
   onGuide: () => void;
   notice: (message: string) => void;
   children: ReactNode;
@@ -256,6 +259,7 @@ export function StudioShell({
             {saved ? <Check size={13} /> : <CircleAlert size={13} />}
             <span>{saved ? 'Saved locally' : 'Storage full · unsaved'}</span>
           </span>
+          {queue}
         </span>
         {page === 'Clip editor' && (
           <span className="work-hint">

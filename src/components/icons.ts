@@ -30,6 +30,7 @@ import {
   Volume2,
   ZoomIn,
   type LucideIcon,
+  Gamepad2,
 } from 'lucide-react';
 
 /** The studio's selectors each show an icon beside their label, so a choice reads at a glance. */
@@ -44,6 +45,7 @@ export const FIT_ICONS: Record<string, LucideIcon> = {
   fill: Expand,
   blur: Shrink,
   split: PanelTop,
+  stack: Gamepad2,
 };
 export const FRAMING_ICONS: Record<string, LucideIcon> = {
   hand: Hand,

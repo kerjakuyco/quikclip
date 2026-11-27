@@ -17,7 +17,7 @@ export type Cue = {
   /** A second language under this line, when the clip shows both. */
   translation?: string;
 };
-export type CaptionStyle = 'bold' | 'clean' | 'karaoke' | 'pop' | 'none';
+export type CaptionStyle = 'bold' | 'clean' | 'boxed' | 'karaoke' | 'pop' | 'none';
 export type CaptionPosition = 'bottom' | 'middle' | 'top';
 
 /**
@@ -35,7 +35,91 @@ export type CutCaptions = {
   to?: number;
   /** This clip's lines in another language, matched to the source time they were spoken (`at`). */
   translation?: CaptionTranslation;
+  /** The size against the style's own (MIN_SCALE–MAX_SCALE). Absent is 1. */
+  scale?: number;
+  /** How far top and bottom captions move toward the middle, as a share of the frame's height. Absent is 0. */
+  lift?: number;
+  /** Words lit up wherever they are said, bare (bareWord). Absent lights none. */
+  keywords?: string[];
+  /** The face (CAPTION_FONTS). Absent is Noto Sans. */
+  font?: CaptionFont;
 };
+export type CaptionFont = 'noto' | 'montserrat' | 'poppins' | 'bebas' | 'anton';
+/**
+ * The bundled caption faces (public/fonts, SIL OFL; captions.rs FACES), each with its preview family and its size
+ * against Noto Sans's, so every face reads about as large.
+ */
+export const CAPTION_FONTS: {
+  value: CaptionFont;
+  label: string;
+  description: string;
+  family: string;
+  scale: number;
+}[] = [
+  {
+    value: 'noto',
+    label: 'Noto Sans',
+    description: 'Neutral, reads in every language',
+    family: "'Quikclip Captions'",
+    scale: 1,
+  },
+  {
+    value: 'montserrat',
+    label: 'Montserrat',
+    description: 'Wide and heavy, the creator look',
+    family: "'Quikclip Montserrat'",
+    scale: 0.92,
+  },
+  {
+    value: 'poppins',
+    label: 'Poppins',
+    description: 'Round and friendly',
+    family: "'Quikclip Poppins'",
+    scale: 0.94,
+  },
+  {
+    value: 'bebas',
+    label: 'Bebas Neue',
+    description: 'Tall condensed capitals',
+    family: "'Quikclip Bebas'",
+    scale: 1.24,
+  },
+  {
+    value: 'anton',
+    label: 'Anton',
+    description: 'Loud condensed headline type',
+    family: "'Quikclip Anton'",
+    scale: 1,
+  },
+];
+export function captionFont(captions: Pick<CutCaptions, 'font'>) {
+  return CAPTION_FONTS.find((font) => font.value === captions.font) ?? CAPTION_FONTS[0];
+}
+/** Caption sizes and how far they move (src-tauri captions.rs MIN_SCALE, MAX_SCALE, MAX_LIFT, MAX_KEYWORDS). */
+export const MIN_SCALE = 0.7;
+export const MAX_SCALE = 1.5;
+export const MAX_LIFT = 0.3;
+export const MAX_KEYWORDS = 24;
+export const CAPTION_SCALES = [
+  { value: 0.85, label: 'S' },
+  { value: 1, label: 'M' },
+  { value: 1.2, label: 'L' },
+  { value: 1.4, label: 'XL' },
+] as const;
+/** A word compared without case or the punctuation around it (captions.rs bare). */
+export function bareWord(word: string) {
+  return word.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '').toLowerCase();
+}
+/** Keywords as a clip keeps them: bare, once each, at most MAX_KEYWORDS. */
+export function cleanKeywords(words: readonly unknown[] | undefined): string[] {
+  const out: string[] = [];
+  for (const word of words ?? []) {
+    if (typeof word !== 'string') continue;
+    const bare = bareWord(word);
+    if (bare && bare.length <= 64 && !out.includes(bare)) out.push(bare);
+  }
+  return out.slice(0, MAX_KEYWORDS);
+}
 
 /** The languages captions translate into. The same codes and names reach the model (src-tauri translate.rs). */
 export const TRANSLATE_LANGUAGES = [
@@ -85,6 +169,7 @@ export type TranscriptFixes = Record<number, string>;
 export const CAPTION_STYLES: { value: CaptionStyle; label: string; description: string }[] = [
   { value: 'bold', label: 'Bold', description: 'Capitals, the word being said lights up' },
   { value: 'clean', label: 'Clean', description: 'Calm text with a soft shadow' },
+  { value: 'boxed', label: 'Boxed', description: 'Each line on a dark box, like subtitles' },
   { value: 'karaoke', label: 'Karaoke', description: 'Each word fills as it’s spoken' },
   { value: 'pop', label: 'Pop', description: 'A few words at a time, the spoken one boxed' },
   { value: 'none', label: 'Off', description: 'No text on the video' },
@@ -532,6 +617,7 @@ function ownTranslation(value: unknown): CaptionTranslation | undefined {
   return lines.length ? { language, both: raw.both === true, lines } : undefined;
 }
 
+const isNumber = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n);
 const finite = (start: unknown, end: unknown) =>
   typeof start === 'number' &&
   typeof end === 'number' &&
@@ -561,6 +647,29 @@ export function cutCaptions(cut: { captions?: Partial<CutCaptions> | null }): Cu
     highlight: known(c.highlight, HIGHLIGHT_COLOR),
     ...(own ? { words, from: c.from, to: c.to } : {}),
     ...(translation ? { translation } : {}),
+    ...(isNumber(c.scale) && c.scale !== 1
+      ? { scale: Math.min(MAX_SCALE, Math.max(MIN_SCALE, c.scale)) }
+      : {}),
+    ...(isNumber(c.lift) && c.lift !== 0
+      ? { lift: Math.min(MAX_LIFT, Math.max(-MAX_LIFT, c.lift)) }
+      : {}),
+    ...(c.keywords?.length ? { keywords: cleanKeywords(c.keywords) } : {}),
+    ...(c.font && c.font !== 'noto' && CAPTION_FONTS.some((font) => font.value === c.font)
+      ? { font: c.font }
+      : {}),
+  };
+}
+/** What an export is told about a clip's caption look (captions.rs Request), past its cues. */
+export function captionLook(captions: CutCaptions) {
+  return {
+    style: captions.style,
+    position: captions.position,
+    color: captions.color,
+    highlight: captions.highlight,
+    scale: captions.scale ?? 1,
+    lift: captions.lift ?? 0,
+    keywords: captions.keywords ?? [],
+    font: captionFont(captions).value,
   };
 }
 
@@ -721,6 +830,10 @@ export function transcriptLines(captions: CutCaptions): CutCaptions {
     position: captions.position,
     color: captions.color,
     highlight: captions.highlight,
+    ...(captions.scale !== undefined ? { scale: captions.scale } : {}),
+    ...(captions.lift !== undefined ? { lift: captions.lift } : {}),
+    ...(captions.keywords ? { keywords: captions.keywords } : {}),
+    ...(captions.font ? { font: captions.font } : {}),
   };
 }
 
@@ -764,9 +877,9 @@ export function readingLines(
 
 /** clip-ai CAPTION_SIZES (ASS points at a 1080 px short side) and margins (share of height: line styles, Pop). */
 const CAPTION_SIZES = {
-  vertical: { clean: 66, bold: 70, karaoke: 70, pop: 104 },
-  square: { clean: 62, bold: 66, karaoke: 66, pop: 96 },
-  wide: { clean: 62, bold: 66, karaoke: 66, pop: 90 },
+  vertical: { clean: 66, boxed: 66, bold: 70, karaoke: 70, pop: 104 },
+  square: { clean: 62, boxed: 62, bold: 66, karaoke: 66, pop: 96 },
+  wide: { clean: 62, boxed: 62, bold: 66, karaoke: 66, pop: 90 },
 } as const;
 const CAPTION_MARGINS = {
   vertical: [0.24, 0.3],

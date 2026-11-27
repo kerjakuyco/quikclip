@@ -28,6 +28,69 @@ import { MAX_TEXTS, TEXT_ANIMATIONS, TEXT_PRESETS, type TextLayer } from './text
  * with a reply and edits. Every edit is checked here before it touches the project, and they apply as one undo step.
  */
 export type Turn = { role: 'user' | 'assistant'; text: string };
+/** One edit the assistant made, as the studio describes it under the reply. `clip` is the clip it is about. */
+export type Change = {
+  kind: 'add' | 'edit' | 'remove' | 'select' | 'look' | 'text';
+  text: string;
+  clip?: string;
+};
+/** A turn as the studio keeps it: the reply, and what it changed or could not. */
+export type StoredTurn = Turn & {
+  edits?: number;
+  changes?: Change[];
+  skipped?: string[];
+  error?: boolean;
+};
+
+const FIT_WORDS: Record<string, string> = {
+  fill: 'fill the frame',
+  blur: 'whole video',
+  split: 'split layout',
+  stack: 'facecam layout',
+};
+const FRAMING_WORDS: Record<string, string> = {
+  center: 'centered',
+  faces: 'follows faces',
+  speaker: 'follows the speaker',
+};
+
+/** What an edit to a clip's settings did, in a few words each. */
+function patchWords(patch: Partial<Cut>): string[] {
+  const words: string[] = [];
+  if (patch.title !== undefined) words.push(`renamed “${patch.title}”`);
+  if (patch.start !== undefined && patch.end !== undefined)
+    words.push(`trimmed to ${clock(patch.start)}–${clock(patch.end)}`);
+  if (patch.shape) words.push(`${FRAME_PRESETS[patch.shape].label} frame`);
+  if (patch.fit) words.push(FIT_WORDS[patch.fit] ?? patch.fit);
+  if ('framing' in patch) words.push(FRAMING_WORDS[patch.framing ?? ''] ?? 'framed by hand');
+  if ('speed' in patch) words.push(`${patch.speed ?? 1}× speed`);
+  if (patch.headline !== undefined)
+    words.push(patch.headline ? `headline “${patch.headline}”` : 'no headline');
+  if (patch.captions) {
+    const style = CAPTION_STYLES.find((item) => item.value === patch.captions?.style);
+    words.push(
+      style?.value === 'none'
+        ? 'captions off'
+        : `${style?.label ?? 'Bold'} captions${
+            patch.captions.position === 'middle'
+              ? ' in the middle'
+              : patch.captions.position === 'top'
+                ? ' at the top'
+                : ''
+          }`,
+    );
+  }
+  const toggles = [
+    ['pauses', 'pauses cut', 'pauses kept'],
+    ['fillers', 'ums cut', 'ums kept'],
+    ['punch', 'punch-ins on', 'punch-ins off'],
+    ['voice', 'clearer voice', 'original sound'],
+  ] as const;
+  for (const [key, on, off] of toggles) if (key in patch) words.push(patch[key] ? on : off);
+  if ('loudness' in patch)
+    words.push(patch.loudness ? `${patch.loudness} loudness` : 'loudness as recorded');
+  return words;
+}
 export type Op = Record<string, unknown> & { op: string };
 
 const MIN_CLIP = 0.25;
@@ -183,8 +246,16 @@ export function applyOps(
   let project = p;
   let applied = 0;
   const skipped: string[] = [];
+  const changes: Change[] = [];
   const targets = (id: unknown) =>
     id === 'all' ? project.cuts : project.cuts.filter((item) => item.id === id);
+  // Who an edit was for: the clip by name, or how many.
+  const who = (id: unknown, found: readonly Cut[]) =>
+    id === 'all' && found.length > 1
+      ? 'Every clip'
+      : found.length === 1
+        ? `“${found[0].title}”`
+        : `${found.length} clips`;
   const change = (ids: Set<string>, fn: (cut: Cut) => Cut) => {
     project = {
       ...project,
@@ -215,6 +286,11 @@ export function applyOps(
         };
         project = { ...project, cuts: [...project.cuts, clip], selected: clip.id };
         applied++;
+        changes.push({
+          kind: 'add',
+          text: `Added “${clip.title}”, ${clock(clip.start)}–${clock(clip.end)}`,
+          clip: clip.id,
+        });
         break;
       }
       case 'update_clip': {
@@ -224,13 +300,21 @@ export function applyOps(
           break;
         }
         let any = false;
+        let said: string[] = [];
         change(new Set(found.map((item) => item.id)), (item) => {
           const patch = settings(item, set, mediaOf(project, item).duration);
           if (Object.keys(patch).length) any = true;
+          if (!said.length) said = patchWords(patch);
           return { ...item, ...patch };
         });
-        if (any) applied++;
-        else skipped.push('an edit with no setting the studio knows');
+        if (any) {
+          applied++;
+          changes.push({
+            kind: 'edit',
+            text: `${who(op.id, found)}: ${said.join(', ') || 'updated'}`,
+            ...(found.length === 1 ? { clip: found[0].id } : {}),
+          });
+        } else skipped.push('an edit with no setting the studio knows');
         break;
       }
       case 'remove_clip': {
@@ -246,12 +330,14 @@ export function applyOps(
           selected: ids.has(project.selected) ? rest[0].id : project.selected,
         };
         applied++;
+        changes.push({ kind: 'remove', text: `Removed ${who(op.id, found)}` });
         break;
       }
       case 'select_clip':
         if (found.length === 1) {
           project = { ...project, selected: found[0].id };
           applied++;
+          changes.push({ kind: 'select', text: `Showing “${found[0].title}”`, clip: found[0].id });
         } else skipped.push(`choosing a clip that isn't there`);
         break;
       case 'apply_look': {
@@ -264,6 +350,11 @@ export function applyOps(
         }
         change(new Set(found.map((item) => item.id)), (item) => applyLook(item, look.look));
         applied++;
+        changes.push({
+          kind: 'look',
+          text: `${who(op.id, found)}: the “${look.name}” look`,
+          ...(found.length === 1 ? { clip: found[0].id } : {}),
+        });
         break;
       }
       case 'add_text': {
@@ -296,11 +387,16 @@ export function applyOps(
           return { ...item, texts: [...(item.texts ?? []), layer].slice(0, MAX_TEXTS) };
         });
         applied++;
+        changes.push({
+          kind: 'text',
+          text: `${who(op.id, found)}: text “${words}”`,
+          ...(found.length === 1 ? { clip: found[0].id } : {}),
+        });
         break;
       }
       default:
         skipped.push(`an edit the studio doesn't know (${String(op.op).slice(0, 30)})`);
     }
   }
-  return { project, applied, skipped };
+  return { project, applied, skipped, changes };
 }

@@ -25,7 +25,11 @@ import {
   Square,
   TextCursorInput,
   Trash2,
+  Play,
 } from 'lucide-react';
+import { ScoreCard, scoreTone } from './Score';
+import { CAM_CORNERS, MAX_CAM, MIN_CAM, camAt, camCorner, camFromFaces, cutCam } from '../facecam';
+import { AiSuggest, type AiAccess } from './AiSuggest';
 import { HEADLINE_MAX } from '../headline';
 import { defaultLogoCorner, LOGO_CORNERS } from '../logo';
 import { cutSpeed, SPEEDS } from '../speed';
@@ -209,20 +213,22 @@ function MusicFields({
                 commit={(start) => setMix({ start })}
               />
               <label className="music-repeat">
+                Loop track
                 <input
                   type="checkbox"
+                  role="switch"
                   checked={mix.loop}
                   onChange={(e) => setMix({ loop: e.target.checked })}
                 />
-                Loop track
               </label>
               <label className="music-repeat">
+                Lower under speech
                 <input
                   type="checkbox"
+                  role="switch"
                   checked={mix.duck}
                   onChange={(e) => setMix({ duck: e.target.checked || undefined })}
                 />
-                Lower under speech
               </label>
             </div>
             <div className="music-fades">
@@ -335,6 +341,7 @@ function MixSlider({
         max={max}
         step={step}
         value={value}
+        style={{ '--fill': `${(value / max) * 100}%` } as CSSProperties}
         onChange={(e) => change(Number(e.target.value))}
       />
     </label>
@@ -440,10 +447,98 @@ function LogoFields({
   );
 }
 
+/** The stacked layout's facecam: which corner of the source, how big, or around the face found in the clip. */
+function FacecamFields({
+  cut,
+  width,
+  height,
+  update,
+  faces,
+  findFaces,
+}: {
+  cut: Cut;
+  width: number;
+  height: number;
+  update: (c: Partial<Cut>) => void;
+  faces: FaceStatus | null;
+  findFaces: () => void;
+}) {
+  const cam = cutCam(cut, width, height);
+  const corner = camCorner(cam);
+  const around = camFromFaces(cut, width, height);
+  return (
+    <div className="facecam-fields" role="group" aria-labelledby="facecam-title">
+      <span className="field-label" id="facecam-title">
+        Facecam
+      </span>
+      <div className="format-options facecam-corners" role="group" aria-label="Facecam corner">
+        {CAM_CORNERS.map(({ value, label }) => (
+          <button
+            key={value}
+            type="button"
+            className={corner === value ? 'active' : ''}
+            aria-pressed={corner === value}
+            onClick={() => update({ cam: camAt(value, cam.w, cut.shape, width, height) })}
+          >
+            <span className="corner-preview" data-corner={value} aria-hidden="true" />
+            {label}
+          </button>
+        ))}
+      </div>
+      <label className="crop-axis">
+        <span>Size</span>
+        <input
+          type="range"
+          aria-label="Facecam size"
+          min={MIN_CAM}
+          max={MAX_CAM}
+          step={0.01}
+          value={cam.w}
+          style={
+            {
+              '--fill': `${((cam.w - MIN_CAM) / (MAX_CAM - MIN_CAM)) * 100}%`,
+            } as CSSProperties
+          }
+          onChange={(e) =>
+            update({ cam: camAt(corner, Number(e.target.value), cut.shape, width, height) })
+          }
+        />
+        <span aria-hidden="true">{Math.round(cam.w * 100)}%</span>
+      </label>
+      <div className="facecam-face">
+        {around ? (
+          <button type="button" className="text-btn" onClick={() => update({ cam: around })}>
+            <ScanFace size={13} aria-hidden="true" /> Frame the face found
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="text-btn"
+            disabled={!faceDetection || faces?.state === 'working'}
+            onClick={findFaces}
+          >
+            {faces?.state === 'working' ? (
+              <LoaderCircle className="spin" size={13} aria-hidden="true" />
+            ) : (
+              <ScanFace size={13} aria-hidden="true" />
+            )}
+            {faces?.state === 'working' ? 'Finding the face…' : 'Find the face'}
+          </button>
+        )}
+        {faces?.state === 'error' && <p className="caption-error">{faces.text}</p>}
+      </div>
+      <p className="fit-note">
+        The box fills the top of the frame; the game fills the rest. Move it under Gameplay
+        position.
+      </p>
+    </div>
+  );
+}
+
 /** How finding faces for the selected clip is going, when it isn't done. */
 export type FaceStatus = { state: 'working' } | { state: 'error'; text: string };
-/** The system face detector is a Windows API (src-tauri faces.rs). */
-const faceDetection = desktop && /windows/i.test(navigator.userAgent);
+/** Faces are found in the desktop app on every system: Windows' own detector, or the bundled one (src-tauri faces.rs). */
+const faceDetection = desktop;
 const FRAMINGS = [
   ['hand', 'By hand', 'Place the crop yourself'],
   ['center', 'Center', 'Keep the crop in the middle of the source'],
@@ -517,6 +612,11 @@ function FrameFields({
                         'Split: face on top',
                         'A crop of the speaker on top, the whole picture below',
                       ],
+                      [
+                        'stack',
+                        'Facecam + gameplay',
+                        'Your camera box on top, the game below: for streams',
+                      ],
                     ] as const)
                   : []),
               ] as const
@@ -530,10 +630,21 @@ function FrameFields({
                   aria-pressed={fit === mode}
                   title={hint}
                   aria-label={label}
-                  onClick={() => update({ fit: mode })}
+                  onClick={() =>
+                    update(
+                      mode === 'stack' && !cut.cam
+                        ? {
+                            fit: mode,
+                            cam:
+                              camFromFaces(cut, p.width, p.height) ??
+                              cutCam(cut, p.width, p.height),
+                          }
+                        : { fit: mode },
+                    )
+                  }
                 >
                   <Icon size={14} aria-hidden="true" />
-                  {mode === 'blur' ? 'Whole video' : label}
+                  {mode === 'blur' ? 'Whole video' : mode === 'stack' ? 'Facecam' : label}
                 </button>
               );
             })}
@@ -543,7 +654,17 @@ function FrameFields({
               The top band follows the framing below; the whole picture fills the rest.
             </p>
           )}
-          {fit !== 'blur' && adjustable.length > 0 && (
+          {fit === 'stack' && (
+            <FacecamFields
+              cut={cut}
+              width={p.width}
+              height={p.height}
+              update={update}
+              faces={faces}
+              findFaces={() => findFaces(false)}
+            />
+          )}
+          {fit !== 'blur' && fit !== 'stack' && adjustable.length > 0 && (
             <>
               <span className="field-label" id="framing-title">
                 Framing
@@ -563,7 +684,7 @@ function FrameFields({
                       className={framing === mode ? 'active' : ''}
                       aria-pressed={framing === mode}
                       disabled={unavailable}
-                      title={unavailable ? 'Face tracking is in the Windows desktop app' : hint}
+                      title={unavailable ? 'Face tracking is in the desktop app' : hint}
                       onClick={() => {
                         update({ framing: mode === 'hand' ? undefined : mode });
                         const missing = !found || (mode === 'speaker' && !found.speaker);
@@ -628,11 +749,11 @@ function FrameFields({
               )}
             </>
           )}
-          {fit !== 'blur' && framing === 'hand' && adjustable.length > 0 && (
+          {fit !== 'blur' && (framing === 'hand' || fit === 'stack') && adjustable.length > 0 && (
             <div className="crop-controls" role="group" aria-labelledby="crop-position-title">
               <div className="settings-label-line">
                 <span className="field-label" id="crop-position-title">
-                  Crop position
+                  {fit === 'stack' ? 'Gameplay position' : 'Crop position'}
                 </span>
                 <button
                   type="button"
@@ -700,6 +821,10 @@ export function Inspector({
   analyze,
   duplicate,
   remove,
+  move,
+  toolAsk,
+  playInOrder,
+  ai,
   notice,
   pauseNote,
   captions,
@@ -726,6 +851,20 @@ export function Inspector({
   analyze: () => void;
   duplicate: () => void;
   remove: () => void;
+  /** Moves a clip to another place in the bin (the order a joined video plays in). */
+  move?: (id: string, to: number) => void;
+  /** Plays every clip in bin order in the monitor, as one joined video. */
+  playInOrder?: () => void;
+  /** A settings tab to show, asked for from elsewhere; `at` makes each ask new. */
+  toolAsk?: { tool: string; at: number } | null;
+  /** The AI by the fields it fills: titles by the clip name, hooks by the headline, callouts by the text tools. */
+  ai?: {
+    access: AiAccess;
+    options: (task: 'titles' | 'hooks') => Promise<string[]>;
+    callouts: () => Promise<string>;
+    /** Whether the clip has words to work from. */
+    spoken: boolean;
+  };
   notice: (text: string) => void;
   pauseNote: string;
   /** The captions section (components/Captions.tsx CaptionFields). */
@@ -770,7 +909,23 @@ export function Inspector({
   const [headline, setHeadline] = useState(cut.headline ?? '');
   const [query, setQuery] = useState('');
   const [length, setLength] = useState<ClipLength>('any');
-  const [tool, setTool] = useState<ClipTool>('frame');
+  // The clip settings tab stays as it was left, and opens when another part of the studio asks for it.
+  const [tool, setToolState] = useState<ClipTool>(() => {
+    const saved = readSaved<string>('tool', 'frame');
+    return CLIP_TOOLS.some(([value]) => value === saved) ? (saved as ClipTool) : 'frame';
+  });
+  function setTool(next: ClipTool) {
+    setToolState(next);
+    try {
+      localStorage.setItem('quikclip.1.tool', JSON.stringify(next));
+    } catch {
+      // It still changes for this session.
+    }
+  }
+  useEffect(() => {
+    if (toolAsk && CLIP_TOOLS.some(([value]) => value === toolAsk.tool))
+      setTool(toolAsk.tool as ClipTool);
+  }, [toolAsk]);
   // The clip list folds away to give the settings the room; it stays as you left it.
   const [binOpen, setBinOpenState] = useState(() => readSaved<boolean>('binOpen', true) !== false);
   function setBinOpen(open: boolean) {
@@ -792,6 +947,29 @@ export function Inspector({
   const shown = p.cuts
     .map((item, index) => ({ cut: item, index }))
     .filter(({ cut: item }) => clipMatches(item, query, length, spoken));
+  // Clips are dragged into a new order only when the whole bin shows, so a drop lands where it looks.
+  const reorderable = !!move && shown.length === p.cuts.length && p.cuts.length > 1;
+  const [dragged, setDragged] = useState<string | null>(null);
+  const [dropAt, setDropAt] = useState<number | null>(null);
+  const cardList = useRef<HTMLDivElement>(null);
+  // The list scrolls itself (never the page) to keep the selected clip in view.
+  useEffect(() => {
+    const list = cardList.current;
+    const card = list?.querySelector<HTMLElement>(`[data-cut="${cut.id}"]`);
+    if (!list || !card || list.scrollHeight <= list.clientHeight) return;
+    const [view, box] = [list.getBoundingClientRect(), card.getBoundingClientRect()];
+    if (box.top < view.top) list.scrollTop -= view.top - box.top;
+    else if (box.bottom > view.bottom) list.scrollTop += box.bottom - view.bottom;
+  }, [cut.id]);
+  function shift(c: Cut, to: number) {
+    if (!move || to < 0 || to >= p.cuts.length) return;
+    move(c.id, to);
+    notice(`${c.title} is now clip ${to + 1} of ${p.cuts.length}.`);
+    // Keep the moved card focused for the next key press.
+    requestAnimationFrame(() =>
+      cardList.current?.querySelector<HTMLElement>(`[data-cut="${c.id}"]`)?.focus(),
+    );
+  }
   return (
     <aside className="inspector" aria-label="Clip inspector">
       <div className="panel-tabs" role="tablist" aria-label="Clips and transcript">
@@ -913,7 +1091,13 @@ export function Inspector({
                     value={length}
                     onChange={setLength}
                   />
-                  <div className="cut-list" role="group" aria-label="Clips">
+                  <div
+                    className={`cut-list${dragged ? ' reordering' : ''}`}
+                    role="group"
+                    aria-label="Clips"
+                    aria-describedby={reorderable ? 'cut-list-hint' : undefined}
+                    ref={cardList}
+                  >
                     {shown.length === 0 && (
                       <div className="clip-empty">
                         <p>
@@ -938,10 +1122,44 @@ export function Inspector({
                       return (
                         <button
                           key={c.id}
-                          className={`cut-card${cut.id === c.id ? ' selected' : ''}`}
+                          className={`cut-card${cut.id === c.id ? ' selected' : ''}${dragged === c.id ? ' dragged' : ''}${dropAt === i && dragged !== c.id ? ' drop-before' : ''}${dropAt === i + 1 && i === p.cuts.length - 1 && dragged !== c.id ? ' drop-after' : ''}`}
                           onClick={() => select(c)}
                           aria-pressed={cut.id === c.id}
-                          title={c.title}
+                          title={reorderable ? `${c.title} · drag to reorder` : c.title}
+                          data-cut={c.id}
+                          draggable={reorderable}
+                          onDragStart={(e) => {
+                            if (!reorderable) return;
+                            e.dataTransfer.effectAllowed = 'move';
+                            e.dataTransfer.setData('text/plain', c.id);
+                            setDragged(c.id);
+                          }}
+                          onDragOver={(e) => {
+                            if (!dragged) return;
+                            e.preventDefault();
+                            const box = e.currentTarget.getBoundingClientRect();
+                            setDropAt(e.clientY > box.top + box.height / 2 ? i + 1 : i);
+                          }}
+                          onDrop={(e) => {
+                            e.preventDefault();
+                            const from = p.cuts.findIndex((item) => item.id === dragged);
+                            if (from >= 0 && dropAt !== null) {
+                              const to = dropAt > from ? dropAt - 1 : dropAt;
+                              if (to !== from) shift(p.cuts[from], to);
+                            }
+                            setDragged(null);
+                            setDropAt(null);
+                          }}
+                          onDragEnd={() => {
+                            setDragged(null);
+                            setDropAt(null);
+                          }}
+                          onKeyDown={(e) => {
+                            if (!reorderable || !e.altKey) return;
+                            if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+                            e.preventDefault();
+                            shift(c, i + (e.key === 'ArrowUp' ? -1 : 1));
+                          }}
                         >
                           <span className="cut-thumb" aria-hidden="true">
                             {thumbnail ? (
@@ -964,6 +1182,11 @@ export function Inspector({
                               {c.highlight && (
                                 <span
                                   className="cut-ai"
+                                  data-tone={
+                                    c.highlight.score !== undefined
+                                      ? scoreTone(c.highlight.score)
+                                      : undefined
+                                  }
                                   title="AI editorial score for the suggested range"
                                 >
                                   <span className="sr-only"> AI suggestion</span>
@@ -988,6 +1211,19 @@ export function Inspector({
                       );
                     })}
                   </div>
+                  {reorderable && (
+                    <div className="cut-list-foot">
+                      <p className="cut-list-hint" id="cut-list-hint">
+                        Drag clips, or press Alt + ↑ / ↓, to reorder them. Joined videos play in
+                        this order.
+                      </p>
+                      {playInOrder && (
+                        <button type="button" className="text-btn" onClick={playInOrder}>
+                          <Play size={12} aria-hidden="true" /> Play in order
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
             </section>
@@ -1003,7 +1239,7 @@ export function Inspector({
                       type="button"
                       className="icon-btn"
                       aria-label="Previous clip"
-                      title="Previous clip"
+                      title="Previous clip ( [ )"
                       disabled={position <= 0}
                       onClick={() => select(p.cuts[position - 1])}
                     >
@@ -1016,7 +1252,7 @@ export function Inspector({
                       type="button"
                       className="icon-btn"
                       aria-label="Next clip"
-                      title="Next clip"
+                      title="Next clip ( ] )"
                       disabled={position >= p.cuts.length - 1}
                       onClick={() => select(p.cuts[position + 1])}
                     >
@@ -1026,7 +1262,7 @@ export function Inspector({
                   <button
                     type="button"
                     className="icon-btn duplicate-clip"
-                    title="Duplicate selected clip"
+                    title="Duplicate selected clip (Ctrl D)"
                     aria-label="Duplicate selected clip"
                     onClick={duplicate}
                   >
@@ -1035,7 +1271,7 @@ export function Inspector({
                   <button
                     type="button"
                     className="icon-btn remove-clip"
-                    title="Remove selected clip"
+                    title="Remove selected clip (Delete)"
                     aria-label="Remove selected clip"
                     disabled={p.cuts.length === 1}
                     onClick={remove}
@@ -1044,17 +1280,29 @@ export function Inspector({
                   </button>
                 </div>
               </div>
-              {cut.highlight?.reason && (
-                <div className="highlight-note">
-                  <span>
-                    <Sparkles size={13} aria-hidden="true" /> Why this was suggested
-                  </span>
-                  <p>{cut.highlight.reason}</p>
-                </div>
+              {(cut.highlight?.reason || cut.highlight?.score !== undefined) && (
+                <ScoreCard highlight={cut.highlight!} />
               )}
-              <label className="field-label">
-                Clip name
+              <div className="field-with-ai">
+                <div className="field-head">
+                  <label className="field-label" htmlFor="clip-name">
+                    Clip name
+                  </label>
+                  {ai?.spoken && (
+                    <AiSuggest
+                      label="Suggest titles"
+                      ai={ai.access}
+                      run={() => ai.options('titles')}
+                      pick={(option) => {
+                        const next = option.slice(0, 64);
+                        setTitle(next);
+                        update({ title: next });
+                      }}
+                    />
+                  )}
+                </div>
                 <input
+                  id="clip-name"
                   value={title}
                   maxLength={64}
                   onChange={(e) => setTitle(e.target.value)}
@@ -1067,7 +1315,7 @@ export function Inspector({
                     if (e.key === 'Enter') e.currentTarget.blur();
                   }}
                 />
-              </label>
+              </div>
               <div className="times" role="group" aria-label="Trim range">
                 <TimeField label="In point" value={cut.start} commit={(n) => trim('start', n)} />
                 <TimeField label="Out point" value={cut.end} commit={(n) => trim('end', n)} />
@@ -1180,7 +1428,12 @@ export function Inspector({
                   <>
                     <h3 className="tool-heading">Captions</h3>
                     {captions}
-                    <h3 className="tool-heading">Text on video</h3>
+                    <div className="tool-heading-row">
+                      <h3 className="tool-heading">Text on video</h3>
+                      {ai?.spoken && (
+                        <AiSuggest label="Suggest callouts" ai={ai.access} run={ai.callouts} />
+                      )}
+                    </div>
                     <TextFields
                       cut={cut}
                       layers={cutTexts(cut)}
@@ -1188,9 +1441,26 @@ export function Inspector({
                       update={update}
                     />
                     <h3 className="tool-heading">Headline and logo</h3>
-                    <label className="field-label">
-                      Headline
+                    <div className="field-with-ai">
+                      <div className="field-head">
+                        <label className="field-label" htmlFor="clip-headline">
+                          Headline
+                        </label>
+                        {ai?.spoken && (
+                          <AiSuggest
+                            label="Suggest hooks"
+                            ai={ai.access}
+                            run={() => ai.options('hooks')}
+                            pick={(option) => {
+                              const next = option.slice(0, HEADLINE_MAX);
+                              setHeadline(next);
+                              update({ headline: next });
+                            }}
+                          />
+                        )}
+                      </div>
                       <input
+                        id="clip-headline"
                         aria-label="Headline"
                         maxLength={HEADLINE_MAX}
                         placeholder="Title at the top of the clip"
@@ -1201,7 +1471,7 @@ export function Inspector({
                           if (e.key === 'Enter') e.currentTarget.blur();
                         }}
                       />
-                    </label>
+                    </div>
                     <LogoFields p={p} cut={cut} update={update} notice={notice} />
                   </>
                 )}

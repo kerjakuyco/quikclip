@@ -25,7 +25,8 @@ export type ClipLook = {
   fit: Fit;
   crop?: CropPosition;
   framing?: Framing;
-  captions: Pick<CutCaptions, 'style' | 'position' | 'color' | 'highlight'>;
+  captions: Pick<CutCaptions, 'style' | 'position' | 'color' | 'highlight'> &
+    Partial<Pick<CutCaptions, 'font' | 'scale' | 'lift'>>;
   logo?: CutLogo;
   punch?: boolean;
   fillers?: boolean;
@@ -114,6 +115,9 @@ export function lookFrom(cut: Cut): ClipLook {
       position: captions.position,
       color: captions.color,
       highlight: captions.highlight,
+      ...(captions.font ? { font: captions.font } : {}),
+      ...(captions.scale ? { scale: captions.scale } : {}),
+      ...(captions.lift ? { lift: captions.lift } : {}),
     },
     ...(logo ? { logo } : {}),
     ...(cut.punch ? { punch: true } : {}),
@@ -182,6 +186,8 @@ export function matchingLook(cut: Cut, looks: readonly NamedLook[]) {
 export function applyLook(cut: Cut, look: ClipLook | null): Cut {
   if (!valid(look)) return cut;
   const captions = cutCaptions({ captions: { ...cut.captions, ...look.captions } });
+  // The look's face, size and nudge, or the plain ones when it has none.
+  const lookCaptions = cutCaptions({ captions: look.captions });
   const logo = cutLogo({ logo: look.logo });
   const framing = look.framing ? cutFraming({ framing: look.framing }) : undefined;
   const fit = cutFit({ fit: look.fit, shape: look.shape });
@@ -193,6 +199,9 @@ export function applyLook(cut: Cut, look: ClipLook | null): Cut {
     framing: framing === 'hand' ? undefined : framing,
     captions: {
       ...(cut.captions ?? {}),
+      font: lookCaptions.font,
+      scale: lookCaptions.scale,
+      lift: lookCaptions.lift,
       style: captions.style,
       position: captions.position,
       color: captions.color,

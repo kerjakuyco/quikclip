@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { CornerDownLeft, Search } from 'lucide-react';
+import { CornerDownLeft, Search, Sparkles } from 'lucide-react';
 
 export type Command = {
   id: string;
@@ -40,24 +40,34 @@ export function commandScore(
 export function CommandPalette({
   commands,
   close,
+  ask,
 }: {
   commands: readonly Command[];
   close: () => void;
+  /** Anything typed can go to the editing assistant, as the last row (or the only one). */
+  ask?: (question: string) => void;
 }) {
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(0);
   const list = useRef<HTMLDivElement>(null);
-  const shown = useMemo(
-    () =>
-      commands
-        .map((command, order) => ({ command, order, score: commandScore(command, query) }))
-        .filter((item) => item.score > 0 && !item.command.disabled)
-        .sort((a, b) => (query ? b.score - a.score : 0) || a.order - b.order)
-        .slice(0, 60)
-        .map((item) => item.command),
-    [commands, query],
-  );
-  useEffect(() => setActive(0), [query]);
+  const shown = useMemo(() => {
+    const matches = commands
+      .map((command, order) => ({ command, order, score: commandScore(command, query) }))
+      .filter((item) => item.score > 0 && !item.command.disabled)
+      .sort((a, b) => (query ? b.score - a.score : 0) || a.order - b.order)
+      .slice(0, 60)
+      .map((item) => item.command);
+    const question = query.trim();
+    // A question of a few words goes to the assistant: first when nothing else matches, else last.
+    if (!ask || question.split(/\s+/).length < 2) return matches;
+    const asking: Command = {
+      id: 'ask-assistant',
+      label: `Ask the assistant: “${question}”`,
+      group: 'AI',
+      run: () => ask(question),
+    };
+    return matches.length ? [...matches, asking] : [asking];
+  }, [commands, query, ask]);
   useEffect(() => {
     list.current?.querySelector(`[data-index="${active}"]`)?.scrollIntoView({ block: 'nearest' });
   }, [active]);
@@ -84,9 +94,17 @@ export function CommandPalette({
             aria-controls="palette-list"
             aria-activedescendant={shown[active] ? `palette-${shown[active].id}` : undefined}
             aria-label="Search commands"
-            placeholder="Type a command, a clip, or a look"
+            placeholder={
+              ask
+                ? 'Type a command, or ask the assistant to edit'
+                : 'Type a command, a clip, or a look'
+            }
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => {
+              // A new search starts at its best match, in the same keystroke, so Enter never runs a stale row.
+              setQuery(e.target.value);
+              setActive(0);
+            }}
             onKeyDown={(e) => {
               if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
                 e.preventDefault();
@@ -94,7 +112,7 @@ export function CommandPalette({
                 setActive((n) => (shown.length ? (n + step + shown.length) % shown.length : 0));
               } else if (e.key === 'Enter') {
                 e.preventDefault();
-                run(shown[active]);
+                run(shown[Math.min(active, shown.length - 1)]);
               } else if (e.key === 'Escape') {
                 e.preventDefault();
                 close();
@@ -116,7 +134,10 @@ export function CommandPalette({
               onMouseMove={() => setActive(index)}
               onClick={() => run(command)}
             >
-              <span className="palette-label">{command.label}</span>
+              <span className="palette-label">
+                {command.group === 'AI' && <Sparkles size={13} aria-hidden="true" />}
+                {command.label}
+              </span>
               <span className="palette-group">{command.group}</span>
               {command.hint && <kbd>{command.hint}</kbd>}
               {index === active && <CornerDownLeft size={13} aria-hidden="true" />}

@@ -7,6 +7,7 @@ import {
   browserBlob,
   browserFrame,
   cropBox,
+  splitBand,
   cropFrame,
   cropRect,
   cutCrop,
@@ -20,6 +21,7 @@ import {
   type Project,
   type Cut,
 } from './studio';
+import { cutCam } from './facecam';
 import type {
   AudioSample,
   AudioSampleSource,
@@ -93,6 +95,36 @@ function paintSplit(
     sh * contain,
   );
   ctx.restore();
+  sample.close();
+  return canvas;
+}
+
+/**
+ * The stacked layout (facecam.ts): the facecam box, cut to the band's shape around its middle, filling the top, and the
+ * gameplay part of the source filling the rest.
+ */
+function paintStack(
+  sample: VideoSample,
+  width: number,
+  height: number,
+  cam: { x: number; y: number; w: number; h: number },
+  game: { left: number; top: number; width: number; height: number },
+  share: number,
+) {
+  const canvas = new OffscreenCanvas(width, height);
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw Error('This browser cannot draw the facecam layout.');
+  const top = Math.round(height * share);
+  const sw = sample.displayWidth;
+  const sh = sample.displayHeight;
+  let [cw, ch] = [cam.w * sw, cam.h * sh];
+  const want = width / top;
+  if (cw / ch > want) cw = ch * want;
+  else ch = cw / want;
+  const cx = cam.x * sw + (cam.w * sw - cw) / 2;
+  const cy = cam.y * sh + (cam.h * sh - ch) / 2;
+  sample.draw(ctx, cx, cy, cw, ch, 0, 0, width, top);
+  sample.draw(ctx, game.left, game.top, game.width, game.height, 0, top, width, height - top);
   sample.close();
   return canvas;
 }
@@ -308,6 +340,8 @@ export async function exportWeb(
       : await browserBlob(project.id);
   const blur = cut.shape !== 'source' && cutFit(cut) === 'blur';
   const split = cut.shape !== 'source' && cutFit(cut) === 'split';
+  const stack = cut.shape !== 'source' && cutFit(cut) === 'stack';
+  const cam = cutCam(cut, project.width, project.height);
   const crop = cropFrame(cut, project.width, project.height);
   const box = cropBox(cut, project.width, project.height);
   const face = cropRect(box, cutCrop(cut), project.width, project.height);
@@ -364,7 +398,7 @@ export async function exportWeb(
       output.setMetadataTags({ title: cut.title });
     }
     signal.throwIfAborted();
-    const draw = Boolean(blur || split || text || mark);
+    const draw = Boolean(blur || split || stack || text || mark);
     const decorate = (canvas: OffscreenCanvas) => {
       const ctx = canvas.getContext('2d');
       if (!ctx) {
@@ -379,7 +413,7 @@ export async function exportWeb(
       return canvas;
     };
     const video: ConversionVideoOptions = { codec: 'vp8' };
-    if (!blur && !split) {
+    if (!blur && !split && !stack) {
       // Crop in source pixels before resizing, including when overlays or speed are enabled.
       Object.assign(video, { width, height, fit: 'fill' });
       if (cut.shape !== 'source') video.crop = crop;
@@ -406,7 +440,9 @@ export async function exportWeb(
             ? paintBlur(sample, width, height)
             : split
               ? paintSplit(sample, width, height, face, box.height / crop.height)
-              : drawFrame(sample, width, height),
+              : stack
+                ? paintStack(sample, width, height, cam, face, splitBand(crop.height) / crop.height)
+                : drawFrame(sample, width, height),
         );
         return new VideoSample(canvas, { timestamp: at / pace, duration });
       };

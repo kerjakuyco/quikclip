@@ -13,6 +13,7 @@ import {
   captionTop,
   captionWords,
   correctedWords,
+  captionLook,
   cutCaptions,
   TRANSLATE_LANGUAGES,
   languageName,
@@ -30,6 +31,8 @@ import {
   ArrowDownToLine,
   BookOpen,
   Check,
+  ChevronDown,
+  ChevronUp,
   CircleAlert,
   Clock3,
   Download,
@@ -52,6 +55,8 @@ import {
   Volume2,
   VolumeX,
   X,
+  ListVideo,
+  Undo2,
 } from 'lucide-react';
 import {
   asset,
@@ -83,6 +88,9 @@ import {
   type Bookend,
   type Transition,
   projectVideos,
+  moveItem,
+  fromMedia,
+  splitBand,
   withMedia,
   type Video,
   logoBlob,
@@ -118,9 +126,28 @@ import { clipClock, pauseSummary, scanCut, type PausePlan } from './pauses';
 import { cutSpeed, playedLength } from './speed';
 import { Inspector, type FaceStatus, type InspectorPanel } from './components/Inspector';
 import { AssistantPanel } from './components/AssistantPanel';
-import { applyOps, assistantContext, parseAssistant, type Turn } from './assistant';
+import { applyOps, assistantContext, parseAssistant, type StoredTurn } from './assistant';
 import type { Platform, Post, Tone } from './post';
 import { MirrorVideo } from './components/MirrorVideo';
+import { saveWorkspace, savedPart } from './workspace';
+import { localConnection, readTranscriber, writeTranscriber } from './transcriber';
+import { inSpans } from './textcut';
+import { clipLayers, type LaneLayer } from './lanes';
+import { cutCam } from './facecam';
+import { sequenceItems, sequenceLabel, type Sequence, type SequenceItem } from './sequence';
+import { BackgroundJob, jobSummary, type RunningJob } from './components/BackgroundJob';
+import {
+  calloutLayers,
+  clipPayload,
+  suggestedCuts,
+  takeCuts,
+  type SuggestTask,
+  type SuggestedCut,
+  type Suggestion,
+} from './suggest';
+import { AiSuggest, type AiAccess } from './components/AiSuggest';
+import { nextRender, RENDER_COMMAND, type RenderTask } from './renders';
+import { RenderQueue } from './components/RenderQueue';
 import { CommandPalette, type Command } from './components/CommandPalette';
 import { VideoMenu } from './components/VideoMenu';
 import { FRAME_ICONS, IMPORT_ICONS, JOIN_ICONS, TRANSITION_ICONS } from './components/icons';
@@ -163,7 +190,8 @@ import {
   type TrimMotion,
   type TrimSnap,
 } from './timeline';
-import type { HighlightOptions } from './highlights';
+import type { HighlightOptions, Moment } from './highlights';
+import { Moments } from './components/Moments';
 import { exportJobs, MAX_EXPORT_FILES, type ExportJob } from './export-plan';
 import { safeInsets } from './safe-areas';
 import { Dialog } from './components/Dialog';
@@ -174,17 +202,36 @@ import './studio.css';
 type Modal = 'import' | 'export' | 'ai' | 'keys' | 'guide' | 'delete' | 'video' | null;
 const shortcuts = [
   ['Space', 'Play / pause'],
+  ['J  K  L', 'Back 5 s / pause / forward 5 s'],
   ['←  →', 'Step one frame'],
+  ['Shift ←  →', 'Step one second'],
+  ['Home  End', 'Go to the clip’s in / out point'],
   ['I', 'Set clip in point'],
   ['O', 'Set clip out point'],
+  ['[  ]', 'Previous / next clip'],
+  ['Ctrl D', 'Duplicate clip'],
+  ['Delete', 'Remove clip (undo brings it back)'],
+  ['Alt ↑  ↓', 'Move the clip in the list'],
   ['M', 'Mute / unmute'],
+  ['Ctrl E', 'Export clip'],
   ['Ctrl K', 'Command palette'],
   ['Ctrl Z', 'Undo'],
   ['Ctrl Shift Z', 'Redo'],
   ['?', 'Keyboard shortcuts'],
 ];
+/** A clip's caption words without what it cuts: its ums (when cut) and words cut in the transcript. */
+function spokenWords<W extends { start: number; end: number; text: string }>(
+  words: W[],
+  cut: Pick<Cut, 'fillers' | 'removed'>,
+) {
+  return words.filter(
+    (word) =>
+      !(cut.fillers && isFiller(word.text)) &&
+      !(cut.removed?.length && inSpans(cut.removed, (word.start + word.end) / 2)),
+  );
+}
 function initialProjects() {
-  const saved = readSaved<unknown>('projects', null);
+  const saved = savedPart<unknown>('projects', null);
   return Array.isArray(saved) &&
     saved.length &&
     saved.every((p) => p?.id && p.duration > 0 && p.cuts?.length && Array.isArray(p.frames))
@@ -193,8 +240,8 @@ function initialProjects() {
 }
 export default function App() {
   const [projects, setProjects] = useState<Project[]>(initialProjects);
-  const [active, setActive] = useState(() => readSaved('active', 'sample'));
-  const [entries, setEntries] = useState<ExportEntry[]>(() => readSaved('exports', []));
+  const [active, setActive] = useState(() => savedPart('active', 'sample'));
+  const [entries, setEntries] = useState<ExportEntry[]>(() => savedPart('exports', []));
   const p = projects.find((x) => x.id === active) ?? projects[0],
     cut = p.cuts.find((c) => c.id === p.selected) ?? p.cuts[0];
   // The video the selected clip cuts from: what plays, is transcribed, and is exported.
@@ -208,7 +255,9 @@ export default function App() {
   const [url, setUrl] = useState(''),
     [busy, setBusy] = useState(''),
     [error, setError] = useState(''),
-    [toast, setToast] = useState('');
+    [toast, setToast] = useState(''),
+    // The toast that offers Undo (the edit it reports is the last one in history).
+    [undoFor, setUndoFor] = useState('');
   const [src, setSrc] = useState(''),
     [sourceError, setSourceError] = useState(''),
     [time, setTime] = useState(0),
@@ -240,17 +289,57 @@ export default function App() {
   const [lookName, setLookName] = useState(() => readLook()?.name);
   const [ownLooks, setOwnLooks] = useState<NamedLook[]>(readLooks);
   const allLooks = useMemo(() => [...BUILT_IN_LOOKS, ...ownLooks], [ownLooks]);
-  const [panel, setPanel] = useState<InspectorPanel>('clips');
+  const [panel, setPanelState] = useState<InspectorPanel>(() => {
+    const saved = readSaved<string>('panel', 'clips');
+    return saved === 'transcript' || saved === 'assistant' ? saved : 'clips';
+  });
+  function setPanel(next: InspectorPanel) {
+    setPanelState(next);
+    try {
+      localStorage.setItem('quikclip.1.panel', JSON.stringify(next));
+    } catch {
+      // It still changes for this session.
+    }
+  }
+  // A clip settings tab asked for from elsewhere (a layer double-clicked in the timeline).
+  const [toolAsk, setToolAsk] = useState<{ tool: string; at: number } | null>(null);
   // The assistant's conversation, by project, and post copy being written.
-  const [turns, setTurns] = useState<Record<string, (Turn & { edits?: number })[]>>({});
+  const [turns, setTurns] = useState<Record<string, StoredTurn[]>>({});
   const [assisting, setAssisting] = useState(false);
   const [postWriting, setPostWriting] = useState(false);
+  // Exports waiting and rendering in the background (renders.ts).
+  const [renders, setRenders] = useState<RenderTask[]>([]);
+  // A highlight search's moments, waiting to be picked in Highlight finder.
+  const [moments, setMoments] = useState<Moment[] | null>(null);
+  // The joined video previewed in the monitor (sequence.ts), and a flash at each change when clips meet with a transition.
+  const [sequence, setSequence] = useState<Sequence | null>(null);
+  const sequenceRef = useRef<Sequence | null>(null);
+  sequenceRef.current = sequence;
+  const startPending = useRef(false);
+  const [seam, setSeam] = useState(0);
+  // Cuts the AI suggested for a clip, marked in the transcript until taken or dismissed (suggest.ts).
+  const [suggested, setSuggested] = useState<{ clip: string; cuts: SuggestedCut[] } | null>(null);
+  // A Whisper server on this computer, when speech is turned into text here (transcriber.ts).
+  const [transcriber, setTranscriberState] = useState(readTranscriber);
   const [safeAreas, setSafeAreas] = useState(false);
   const [batchIds, setBatchIds] = useState<string[]>([]);
   const [batchShapes, setBatchShapes] = useState<Shape[]>([]);
   // Batch exports as separate files, or the clips joined into one video.
   const [joined, setJoined] = useState(false);
   const [transition, setTransition] = useState<Transition>('cut');
+  // Exports encode on the graphics card when one can (media.rs video_encoders), unless turned off here.
+  const [gpu, setGpuState] = useState(() => readSaved<boolean>('gpu', true) !== false);
+  useEffect(() => {
+    if (desktop) void invoke('set_gpu_exports', { on: gpu }).catch(() => {});
+  }, [gpu]);
+  function setGpu(on: boolean) {
+    setGpuState(on);
+    try {
+      localStorage.setItem('quikclip.1.gpu', JSON.stringify(on));
+    } catch {
+      // The choice still holds for this session.
+    }
+  }
   const [spokenLanguage, setSpokenLanguage] = useState<Record<string, string>>({});
   const [translating, setTranslating] = useState(false);
   const [step, setStep] = useState<JobStep | null>(null),
@@ -268,11 +357,57 @@ export default function App() {
   const [pausePlan, setPausePlan] = useState<PausePlan | null>(null);
   const [pauseError, setPauseError] = useState('');
   const savedProjects = useRef(projects);
+  // A media job this window didn't start (it was running when the window opened or reloaded), shown in the status bar.
+  const [background, setBackground] = useState<RunningJob | null>(null);
+  const backgroundRef = useRef(background);
+  backgroundRef.current = background;
+  useEffect(() => {
+    if (!desktop) return;
+    void invoke<{ title: string; started: number; step: JobStep | null } | null>('current_job')
+      .then((job) => {
+        if (job) setBackground({ title: job.title, since: job.started, step: job.step });
+      })
+      .catch(() => {});
+    const done = listen<{ title: string; error: string | null; kept: boolean }>('job-done', (e) => {
+      // A job this window didn't start says how it ended; its own say so in their dialog.
+      if (backgroundRef.current && e.payload.error && e.payload.error !== 'Operation cancelled.')
+        setToast(`${e.payload.title.replace(/…$/, '')} stopped: ${e.payload.error}`);
+      setBackground(null);
+      if (e.payload.kept) void adoptKeptImport();
+    });
+    return () => {
+      void done.then((stop) => stop());
+    };
+  }, []);
+  /** An import that finished while its window was away becomes a project, with its clip styled by the default look. */
+  async function adoptKeptImport() {
+    const media = await invoke<Parameters<typeof fromMedia>[0] | null>('take_kept_import').catch(
+      () => null,
+    );
+    if (!media) return;
+    const made = fromMedia(media);
+    const look = readLook();
+    const styled = { ...made, cuts: made.cuts.map((c) => applyLook(c, look)) };
+    setProjects((prev) => (prev.some((item) => item.id === styled.id) ? prev : [...prev, styled]));
+    setToast(`“${styled.title}” finished importing. It’s in your projects.`);
+  }
   useEffect(() => {
     if (!desktop) return;
     const subscriptions = [
       listen<string>('studio-progress', (e) => setBusy(e.payload)),
-      listen<JobStep>('studio-step', (e) => setStep(e.payload)),
+      listen<{ job: string; fraction: number }>('render-progress', (e) =>
+        setRenders((prev) =>
+          prev.map((task) =>
+            task.id === e.payload.job && task.status === 'running'
+              ? { ...task, progress: e.payload.fraction }
+              : task,
+          ),
+        ),
+      ),
+      listen<JobStep>('studio-step', (e) => {
+        setStep(e.payload);
+        setBackground((was) => (was ? { ...was, step: e.payload } : was));
+      }),
       listen<{ id: string; done: number; total: number }>('studio-transcript', (e) =>
         setTranscribing((prev) => ({
           ...prev,
@@ -285,16 +420,10 @@ export default function App() {
     };
   }, []);
   useEffect(() => {
-    try {
-      for (const [k, v] of Object.entries({ projects, active, exports: entries }))
-        localStorage.setItem(`quikclip.1.${k}`, JSON.stringify(v));
-      if (savedProjects.current !== projects) {
-        releaseUnusedCutMedia(savedProjects.current, projects);
-        savedProjects.current = projects;
-      }
-      setSaved(true);
-    } catch {
-      setSaved(false);
+    saveWorkspace({ projects, active, exports: entries }, setSaved);
+    if (savedProjects.current !== projects) {
+      releaseUnusedCutMedia(savedProjects.current, projects);
+      savedProjects.current = projects;
     }
   }, [projects, active, entries]);
   useEffect(() => {
@@ -327,7 +456,7 @@ export default function App() {
   }, [m.id]);
   useEffect(() => {
     if (toast) {
-      const t = setTimeout(() => setToast(''), 4000);
+      const t = setTimeout(() => setToast(''), toast === undoFor ? 6500 : 4000);
       return () => clearTimeout(t);
     }
   }, [toast]);
@@ -447,8 +576,9 @@ export default function App() {
           ? pausePlan.cuts.map((item): [number, number] => [item.start, item.end])
           : []),
         ...fillerSpans,
+        ...(cut.removed ?? []),
       ]),
-    [cut.pauses, pausePlan, fillerSpans],
+    [cut.pauses, pausePlan, fillerSpans, cut.removed],
   );
   const skipped = spanSeconds(skipSpans);
   skips.current = skipSpans.map(([start, end]) => ({ start, end }));
@@ -535,17 +665,60 @@ export default function App() {
     frame = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(frame);
   }, [playing, skipSpans, cut.end]);
-  function edit(fn: (old: Project) => Project) {
+  useEffect(() => {
+    const item = sequence?.items[sequence.at];
+    if (!item || item.kind !== 'clip' || !startPending.current) return;
+    const player = video.current;
+    if (!player) return;
+    const go = () => {
+      if (!startPending.current) return;
+      startPending.current = false;
+      player.currentTime = cut.start;
+      syncMusic.current(player, true);
+      player.play().catch(() => setSequence(null));
+    };
+    if (player.readyState >= 2) go();
+    else {
+      player.addEventListener('canplay', go, { once: true });
+      return () => player.removeEventListener('canplay', go);
+    }
+  }, [sequence, cut.id, cut.start, src]);
+  useEffect(() => {
+    const item = sequence?.items[sequence.at];
+    if (!item || item.kind !== 'clip' || item.id !== cut.id || !playing) return;
+    let frame = 0;
+    const tick = () => {
+      const player = video.current;
+      if (player && !player.paused && player.currentTime >= cut.end - 0.03) {
+        advanceSequence();
+        return;
+      }
+      frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, [sequence, cut.id, cut.end, playing]);
+  /**
+   * Changes the project, as an undo step. Drags and typing (`step` false) fold into one step while they run; a
+   * discrete action (`step` true: a duplicate, a removal, a look, an AI edit) is always a step of its own.
+   */
+  function edit(fn: (old: Project) => Project, step = false) {
     const next = fn(p);
     // Choosing a clip is not an edit to undo.
     const changed = (Object.keys(next) as (keyof Project)[]).some(
       (key) => key !== 'selected' && next[key] !== p[key],
     );
-    if (changed) remember(p);
+    if (changed) remember(p, step);
     setProjects((prev) => prev.map((s) => (s.id === p.id ? fn(s) : s)));
   }
-  function remember(before: Project) {
+  function remember(before: Project, step = false) {
     const stack = stacks.current.get(before.id) ?? emptyStack<Project>();
+    if (step) {
+      window.clearTimeout(closing.current);
+      stacks.current.set(before.id, noteEdit(closeEdit(stack), before, false));
+      setHistoryTick((n) => n + 1);
+      return;
+    }
     stacks.current.set(before.id, noteEdit(stack, before, true));
     window.clearTimeout(closing.current);
     closing.current = window.setTimeout(() => {
@@ -598,14 +771,13 @@ export default function App() {
   }
   function applyNamedLook(item: NamedLook) {
     const styled = applyLook(cut, item.look);
-    update(styled);
-    setToast(`Applied the look “${item.name}”`);
-    // A look that follows faces finds them, where the system face detector is.
+    update(styled, true);
+    notifyUndo(`Applied the look “${item.name}”`);
+    // A look that follows faces finds them.
     const framing = cutFraming(styled);
     if (
       (framing === 'faces' || framing === 'speaker') &&
       desktop &&
-      /windows/i.test(navigator.userAgent) &&
       (!styled.faces || (framing === 'speaker' && !styled.faces.speaker)) &&
       !faceJobs[cut.id]
     )
@@ -664,6 +836,14 @@ export default function App() {
       },
       { id: 'add', label: 'Add clip', group: 'Clip', disabled: !editing, run: addCut },
       {
+        id: 'play-in-order',
+        label: 'Play every clip in order',
+        group: 'Playback',
+        keywords: 'joined sequence preview all',
+        disabled: !editing || p.cuts.length < 2,
+        run: () => playInOrder(p.cuts.map((item) => item.id)),
+      },
+      {
         id: 'add-text',
         label: 'Add text at the playhead',
         group: 'Clip',
@@ -713,10 +893,37 @@ export default function App() {
       {
         id: 'assistant',
         label: 'Ask the assistant',
-        group: 'Studio',
+        group: 'AI',
         keywords: 'ai chat edit help',
         disabled: panel === 'assistant',
         run: () => setPanel('assistant'),
+      },
+      {
+        id: 'ai-tighten',
+        label: 'Tighten this clip',
+        group: 'AI',
+        keywords: 'ai cut words rambling false starts trim suggest',
+        disabled: !editing || !transcript,
+        run: () => {
+          setPanel('transcript');
+          runAi(aiTighten);
+        },
+      },
+      {
+        id: 'ai-keywords',
+        label: 'Light up caption keywords',
+        group: 'AI',
+        keywords: 'ai emphasis highlight words captions suggest',
+        disabled: !editing || !transcript,
+        run: () => runAi(aiKeywords),
+      },
+      {
+        id: 'ai-callouts',
+        label: 'Add text callouts',
+        group: 'AI',
+        keywords: 'ai text overlay labels suggest',
+        disabled: !editing || !transcript || cutTexts(cut).length >= 8,
+        run: () => runAi(aiCallouts),
       },
       ...(Object.keys(FRAME_PRESETS) as Shape[]).map((shape) => ({
         id: `frame-${shape}`,
@@ -731,6 +938,7 @@ export default function App() {
           ['fill', 'Fill the frame'],
           ['blur', 'Show the whole video'],
           ['split', 'Split: face on top'],
+          ['stack', 'Facecam + gameplay'],
         ] as const
       ).map(([fit, label]) => ({
         id: `fit-${fit}`,
@@ -741,8 +949,13 @@ export default function App() {
           !editing ||
           cut.shape === 'source' ||
           cutFit(cut) === fit ||
-          (fit === 'split' && cut.shape !== 'vertical' && cut.shape !== 'portrait'),
-        run: () => update({ fit }),
+          ((fit === 'split' || fit === 'stack') &&
+            cut.shape !== 'vertical' &&
+            cut.shape !== 'portrait'),
+        run: () =>
+          update(
+            fit === 'stack' && !cut.cam ? { fit, cam: cutCam(cut, m.width, m.height) } : { fit },
+          ),
       })),
       toggle(
         'pauses',
@@ -885,6 +1098,71 @@ export default function App() {
     : !suggestionModel()
       ? 'Choose a model in Highlight finder first.'
       : null;
+  const aiAccess: AiAccess = { blocked: aiBlocked, connect: () => open('ai') };
+  /** The transcript's words as the Transcript tab numbers them, so suggested cuts land on the words it shows. */
+  const readWords = useMemo(
+    () => (transcript ? readingLines(transcript, m.fixes).flatMap((line) => line.words) : []),
+    [transcript, m.fixes],
+  );
+  /** The clip's words that are still said: inside it, not cut in the transcript, and not ums it cuts. */
+  const saidWords = readWords.filter(
+    (word) =>
+      word.start >= cut.start - 0.01 &&
+      word.end <= cut.end + 0.01 &&
+      spokenWords([word], cut).length > 0,
+  );
+  /** One focused ask of the user's model about the selected clip (src-tauri suggest.rs). */
+  async function suggest(task: SuggestTask, words = saidWords): Promise<Suggestion> {
+    const linked = suggestionModel();
+    if (!linked) throw new Error('Choose a model in Highlight finder first.');
+    return invoke<Suggestion>('suggest_for_clip', {
+      connection: linked.connection,
+      model: linked.model,
+      task,
+      clip: clipPayload(cut, words, transcript?.language),
+    });
+  }
+  /** Options to pick from: titles for the clip, or hooks for its headline. */
+  async function suggestOptions(task: 'titles' | 'hooks') {
+    const answer = await suggest(task);
+    return answer.task === 'titles' || answer.task === 'hooks' ? answer.options : [];
+  }
+  /** The AI's cuts for the clip, marked in the transcript to take or leave. */
+  async function aiTighten() {
+    const target = cut.id;
+    const words = saidWords;
+    const answer = await suggest('tighten', words);
+    const cuts = answer.task === 'tighten' ? suggestedCuts(words, answer.cuts) : [];
+    setSuggested(cuts.length ? { clip: target, cuts } : null);
+    if (!cuts.length) return 'This clip is tight already. Nothing to cut.';
+    const seconds = Math.round(cuts.reduce((sum, c) => sum + c.span[1] - c.span[0], 0) * 10) / 10;
+    return `${cuts.length} ${cuts.length === 1 ? 'cut' : 'cuts'} suggested, ${seconds} s. They’re marked in the transcript.`;
+  }
+  /** The words to light up in the captions, set on the clip. */
+  async function aiKeywords() {
+    const answer = await suggest('keywords');
+    const words = answer.task === 'keywords' ? answer.words : [];
+    update({ captions: { ...captions, keywords: words } }, true);
+    return `Lit up ${words.length} ${words.length === 1 ? 'keyword' : 'keywords'}: ${words.join(', ')}.`;
+  }
+  /** Short text callouts, added to the clip as text layers (one undo step). */
+  async function aiCallouts() {
+    const existing = cutTexts(cut);
+    const answer = await suggest('callouts');
+    const layers = answer.task === 'callouts' ? calloutLayers(answer.texts, existing.length) : [];
+    if (!layers.length) return 'This clip already has as much text as it can hold.';
+    update({ texts: [...existing, ...layers] }, true);
+    return `Added ${layers.length} ${layers.length === 1 ? 'callout' : 'callouts'}. Drag them in the timeline’s Layers lane to move them.`;
+  }
+  /** An AI action run from the command palette: it says what it did, or why it couldn't. */
+  function runAi(action: () => Promise<string>) {
+    if (aiBlocked) {
+      open('ai');
+      return;
+    }
+    setToast('Asking your model…');
+    action().then(notifyUndo, (e) => setToast(errorText(e)));
+  }
   /** The assistant reads the project and transcript, answers, and its edits apply as one undo step. */
   async function askAssistant(instruction: string) {
     const linked = suggestionModel();
@@ -903,19 +1181,24 @@ export default function App() {
       });
       const { reply, ops } = parseAssistant(answer);
       const result = applyOps(p, ops, allLooks, m.id);
-      if (result.applied) edit(() => result.project);
-      const skipped = result.skipped.length ? ` Skipped ${result.skipped.join('; ')}.` : '';
+      if (result.applied) edit(() => result.project, true);
       setTurns((prev) => ({
         ...prev,
         [id]: [
           ...(prev[id] ?? []),
-          { role: 'assistant', text: `${reply}${skipped}`, edits: result.applied },
+          {
+            role: 'assistant',
+            text: reply,
+            edits: result.applied,
+            changes: result.changes,
+            skipped: result.skipped,
+          },
         ],
       }));
     } catch (e) {
       setTurns((prev) => ({
         ...prev,
-        [id]: [...(prev[id] ?? []), { role: 'assistant', text: errorText(e) }],
+        [id]: [...(prev[id] ?? []), { role: 'assistant', text: errorText(e), error: true }],
       }));
     } finally {
       setAssisting(false);
@@ -950,12 +1233,17 @@ export default function App() {
       setPostWriting(false);
     }
   }
-  function update(delta: Partial<Cut>) {
-    edit((s) => ({ ...s, cuts: s.cuts.map((c) => (c.id === cut.id ? { ...c, ...delta } : c)) }));
+  function update(delta: Partial<Cut>, step = false) {
+    edit(
+      (s) => ({ ...s, cuts: s.cuts.map((c) => (c.id === cut.id ? { ...c, ...delta } : c)) }),
+      step,
+    );
   }
   /** The whole video's transcript (src-tauri transcript.rs): made once, in the background, with progress as it goes. */
-  async function transcribe(id: string, again = false) {
-    const linked = transcriptionConnection();
+  async function transcribe(id: string, again = false, local = transcriber) {
+    const linked = local
+      ? { connection: localConnection(local), label: 'Whisper on this computer' }
+      : transcriptionConnection();
     if (!linked) {
       setTranscribing((prev) => ({ ...prev, [id]: { state: 'connect' } }));
       return;
@@ -1029,9 +1317,62 @@ export default function App() {
     return t;
   }
   function select(c: Cut) {
+    // Choosing a clip by hand ends a sequence preview.
+    setSequence(null);
     video.current?.pause();
     edit((s) => ({ ...s, selected: c.id }));
     seek(c.start);
+  }
+  /** Plays these clips in bin order, between the opening shot and end card, as the joined video will. */
+  function playInOrder(ids: readonly string[]) {
+    const items = sequenceItems(p, ids);
+    if (!items.length) return;
+    setModal(null);
+    setSequence({ items, at: 0 });
+    startItem(items[0]);
+  }
+  function startItem(item: SequenceItem) {
+    video.current?.pause();
+    if (item.kind === 'bookend') return;
+    const c = p.cuts.find((entry) => entry.id === item.id);
+    if (!c) return;
+    edit((s) => ({ ...s, selected: c.id }));
+    seek(c.start);
+    startPending.current = true;
+  }
+  /** The next item of the sequence, or its end. */
+  function advanceSequence() {
+    const now = sequenceRef.current;
+    if (!now) return;
+    const at = now.at + 1;
+    const item = now.items[at];
+    if (!item) {
+      video.current?.pause();
+      setSequence(null);
+      return;
+    }
+    const next = { ...now, at };
+    sequenceRef.current = next;
+    setSequence(next);
+    if (transition !== 'cut') setSeam((n) => n + 1);
+    startItem(item);
+  }
+  function stopSequence() {
+    video.current?.pause();
+    setSequence(null);
+  }
+  /** Moves a clip to another place in the bin, which is the order a joined video plays them in. */
+  function moveCut(id: string, to: number) {
+    edit((s) => {
+      const from = s.cuts.findIndex((item) => item.id === id);
+      return from < 0 || from === to ? s : { ...s, cuts: moveItem(s.cuts, from, to) };
+    }, true);
+  }
+  /** Moves a text or b-roll layer of the selected clip to a new time in it (from the timeline's Layers lane). */
+  function placeLayer(layer: LaneLayer, at: number) {
+    if (layer.kind === 'text')
+      update({ texts: (cut.texts ?? []).map((t) => (t.id === layer.id ? { ...t, at } : t)) });
+    else update({ broll: (cut.broll ?? []).map((b) => (b.id === layer.id ? { ...b, at } : b)) });
   }
   function addCut() {
     const start = trimTime(time, 0, m.duration - MIN_CLIP, 0),
@@ -1046,7 +1387,7 @@ export default function App() {
         ...(m.id !== p.id ? { video: m.id } : {}),
       };
     const styled = applyLook(c, readLook());
-    edit((s) => ({ ...s, selected: styled.id, cuts: [...s.cuts, styled] }));
+    edit((s) => ({ ...s, selected: styled.id, cuts: [...s.cuts, styled] }), true);
     setToast('Clip added to the bin');
   }
   function duplicate() {
@@ -1068,19 +1409,28 @@ export default function App() {
       const cuts = [...s.cuts];
       cuts.splice(index + 1, 0, copy);
       return { ...s, cuts, selected: id };
-    });
+    }, true);
     setToast('Clip duplicated');
   }
   function remove() {
     const next = p.cuts.find((c) => c.id !== cut.id);
     if (!next) return;
     video.current?.pause();
-    edit((s) => ({
-      ...s,
-      cuts: s.cuts.filter((c) => c.id !== cut.id),
-      selected: next.id,
-    }));
+    edit(
+      (s) => ({
+        ...s,
+        cuts: s.cuts.filter((c) => c.id !== cut.id),
+        selected: next.id,
+      }),
+      true,
+    );
     seek(next.start);
+    notifyUndo(`Removed “${cut.title}”`);
+  }
+  /** A toast for an edit that Undo takes back, with the button to do it. */
+  function notifyUndo(text: string) {
+    setToast(text);
+    setUndoFor(text);
   }
   function open(m: Modal) {
     video.current?.pause();
@@ -1162,6 +1512,16 @@ export default function App() {
           travel(letter === 'y' || e.shiftKey ? 'redo' : 'undo');
           return;
         }
+        if (letter === 'd' && !e.shiftKey) {
+          e.preventDefault();
+          duplicate();
+          return;
+        }
+        if (letter === 'e' && !e.shiftKey) {
+          e.preventDefault();
+          open('export');
+          return;
+        }
       }
       if (
         modal ||
@@ -1171,6 +1531,8 @@ export default function App() {
         (e.target as HTMLElement)?.closest('input,select,textarea,[contenteditable=true]')
       )
         return;
+      // Shift + arrows step a second; other Shift keys are for the controls that have them.
+      if (e.shiftKey && e.key !== 'ArrowLeft' && e.key !== 'ArrowRight' && e.key !== '?') return;
       if (e.key === '?') {
         e.preventDefault();
         open('keys');
@@ -1184,13 +1546,34 @@ export default function App() {
       if (e.code === 'KeyM') setMuted((s) => !s);
       if (e.code === 'KeyI') trim('start', time, {});
       if (e.code === 'KeyO') trim('end', time, {});
+      // J, K and L: back five seconds, stop, forward five seconds.
+      if (e.code === 'KeyJ' || e.code === 'KeyL') {
+        seek(clamp(time + (e.code === 'KeyJ' ? -5 : 5), 0, m.duration));
+        syncMusic.current(video.current!, !video.current?.paused);
+      }
+      if (e.code === 'KeyK') video.current?.pause();
+      if (e.key === 'Home' || e.key === 'End') {
+        e.preventDefault();
+        video.current?.pause();
+        seek(e.key === 'Home' ? cut.start : cut.end);
+      }
+      // [ and ]: the clip before or after in the list.
+      if (e.key === '[' || e.key === ']') {
+        const at = p.cuts.findIndex((item) => item.id === cut.id) + (e.key === '[' ? -1 : 1);
+        if (p.cuts[at]) select(p.cuts[at]);
+      }
+      if ((e.key === 'Delete' || e.key === 'Backspace') && p.cuts.length > 1) {
+        e.preventDefault();
+        remove();
+      }
       if (
         (e.key === 'ArrowLeft' || e.key === 'ArrowRight') &&
-        !(e.target as HTMLElement)?.closest('.handle')
+        !(e.target as HTMLElement)?.closest('.handle, .layer-block, .cut-card')
       ) {
         e.preventDefault();
         video.current?.pause();
-        seek(time + (e.key === 'ArrowLeft' ? -1 : 1) / (m.fps || 30));
+        const step = e.shiftKey ? 1 : 1 / (m.fps || 30);
+        seek(time + (e.key === 'ArrowLeft' ? -step : step));
       }
     };
     window.addEventListener('keydown', key);
@@ -1272,9 +1655,7 @@ export default function App() {
   async function analyze(connection: Connection, model: string, options: HighlightOptions) {
     await action('Preparing highlight search…', async () => {
       if (!desktop) throw Error('Open the desktop app to connect your AI provider.');
-      const results = await invoke<
-        (Pick<Cut, 'start' | 'end' | 'title' | 'highlight'> & { hook?: string })[]
-      >('find_highlights', {
+      const results = await invoke<Moment[]>('find_highlights', {
         id: m.id,
         connection,
         model,
@@ -1284,29 +1665,148 @@ export default function App() {
         throw Error(
           'No usable highlights were found. Try different options or trim a clip by hand.',
         );
-      const look = readLook();
-      const clips: Cut[] = results.map(({ hook, ...c }) =>
-        applyLook(
-          {
-            ...c,
-            // The review's hook line opens the clip as its headline.
-            ...(hook ? { headline: hook.slice(0, HEADLINE_MAX) } : {}),
-            id: newId(),
-            shape: 'source',
-            fit: 'fill',
-            voice: true,
-            ...(m.id !== p.id ? { video: m.id } : {}),
-          },
-          look,
+      // They're offered first, to pick from.
+      setMoments(results);
+    });
+  }
+  /** The moments picked from a search, as clips in the bin (each with its score and the review's hook as headline). */
+  function addMoments(picked: Moment[]) {
+    if (!picked.length) return;
+    const look = readLook();
+    const clips: Cut[] = picked.map(({ hook, approved: _approved, highlight, ...c }) =>
+      applyLook(
+        {
+          ...c,
+          highlight,
+          // The review's hook line opens the clip as its headline.
+          ...(hook ? { headline: hook.slice(0, HEADLINE_MAX) } : {}),
+          id: newId(),
+          shape: 'source',
+          fit: 'fill',
+          voice: true,
+          ...(m.id !== p.id ? { video: m.id } : {}),
+        },
+        look,
+      ),
+    );
+    edit((s) => ({ ...s, selected: clips[0].id, cuts: [...s.cuts, ...clips] }), true);
+    seek(clips[0].start);
+    setModal(null);
+    setMoments(null);
+    notifyUndo(
+      `${clips.length} ${clips.length === 1 ? 'highlight' : 'highlights'} added to your clip bin`,
+    );
+  }
+  useEffect(() => {
+    if (!desktop) return;
+    const task = nextRender(renders);
+    if (!task) return;
+    setRenders((prev) =>
+      prev.map((item) =>
+        item.id === task.id ? { ...item, status: 'running', progress: 0 } : item,
+      ),
+    );
+    invoke<unknown>(RENDER_COMMAND[task.kind], { ...task.args, job: task.id })
+      .then((result) => finishRender(task, result))
+      .catch((e) =>
+        setRenders((prev) =>
+          prev.map((item) =>
+            item.id === task.id && item.status !== 'cancelled'
+              ? { ...item, status: 'failed', error: errorText(e) }
+              : item,
+          ),
         ),
       );
-      edit((s) => ({ ...s, selected: clips[0].id, cuts: [...s.cuts, ...clips] }));
-      seek(clips[0].start);
-      setModal(null);
-      setToast(`${clips.length} highlights added to your clip bin`);
+  }, [renders]);
+  /** A render that finished: its files go to the export history. */
+  function finishRender(task: RenderTask, result: unknown) {
+    const savedAt = new Date().toISOString();
+    let output = typeof result === 'string' ? result : '';
+    let note = `Rendered “${task.title}”`;
+    let failed = '';
+    let added: ExportEntry[] = [];
+    if (task.kind === 'batch') {
+      const report = result as {
+        folder: string | null;
+        total: number;
+        outputs: { title: string; path: string; duration: number; warning?: string | null }[];
+        failures: { title: string; error: string }[];
+        cancelled: boolean;
+      };
+      output = report.folder ?? '';
+      added = report.outputs.map((item) => ({
+        id: newId(),
+        title: item.title,
+        path: item.path,
+        duration: item.duration,
+        date: savedAt,
+        project: task.project,
+      }));
+      if (!report.outputs.length) failed = report.failures[0]?.error || 'Nothing was rendered.';
+      else
+        note = report.failures.length
+          ? `${report.outputs.length} rendered, ${report.failures.length} failed`
+          : `${report.outputs.length} clips rendered to one folder`;
+    } else if (output) {
+      added = [
+        {
+          id: newId(),
+          title: task.title,
+          path: output,
+          duration: task.duration,
+          date: savedAt,
+          project: task.project,
+        },
+      ];
+    }
+    setRenders((prev) =>
+      prev.map((item) =>
+        item.id === task.id
+          ? failed
+            ? { ...item, status: 'failed', error: failed }
+            : { ...item, status: 'done', progress: 1, output }
+          : item,
+      ),
+    );
+    if (added.length) setEntries((prev) => [...added, ...prev]);
+    setToast(failed || note);
+  }
+  /** Adds a render to the queue with its destination; the export dialog closes and editing goes on. */
+  function enqueue(task: Pick<RenderTask, 'kind' | 'title' | 'target' | 'args' | 'duration'>) {
+    setRenders((prev) => [
+      ...prev,
+      { ...task, id: newId(), project: p.title, status: 'queued', progress: 0 },
+    ]);
+    setModal(null);
+    setToast('Added to the render queue. Keep editing while it renders.');
+  }
+  function cancelRender(task: RenderTask) {
+    setRenders((prev) =>
+      prev.map((item) => (item.id === task.id ? { ...item, status: 'cancelled' } : item)),
+    );
+    if (task.status === 'running') void invoke('cancel_render', { job: task.id }).catch(() => {});
+  }
+  async function queueClip() {
+    await action('Adding to the render queue…', async () => {
+      const target = await invoke<string | null>('pick_export_file', {
+        name: `clip-${cut.title}`,
+      });
+      if (!target) return;
+      const request = await clipRequest(cut, cut.shape);
+      enqueue({
+        kind: 'clip',
+        title: cut.title,
+        target,
+        args: { id: p.id, request, target },
+        duration: playedLength(cut.end - cut.start, skipped, cutSpeed(cut)),
+      });
     });
   }
   async function exporting() {
+    if (desktop) {
+      await queueClip();
+      return;
+    }
     await action(desktop ? 'Rendering your MP4…' : 'Encoding WebM…', async () => {
       const controller = new AbortController();
       abort.current = controller;
@@ -1322,10 +1822,11 @@ export default function App() {
             fit: cutFit(cut),
             ...exportFraming(cut, m.width, m.height),
             loudness: loudnessLufs(cut),
-            drops: fromStart(fillerSpans, cut.start),
+            drops: fromStart(mergeSpans([...fillerSpans, ...(cut.removed ?? [])]), cut.start),
             zooms: fromStart(punchSpans, cut.start),
             broll: brollRequest(cutBroll(cut, projectVideos(p))),
             texts: textsRequest(cutTexts(cut)),
+            cam: cutFit(cut) === 'stack' ? cutCam(cut, m.width, m.height) : null,
             headline: (await headlinePng(pixels.width, pixels.height, cut.headline ?? '')) ?? '',
             voice: cutVoice(cut),
             music: track?.source ?? '',
@@ -1338,10 +1839,7 @@ export default function App() {
               captions.style !== 'none' && cues.length
                 ? JSON.stringify({
                     cues,
-                    style: captions.style,
-                    position: captions.position,
-                    color: captions.color,
-                    highlight: captions.highlight,
+                    ...captionLook(captions),
                     top: captions.position === 'top' ? captionStart : null,
                     language: transcript?.language ?? null,
                   })
@@ -1382,7 +1880,7 @@ export default function App() {
     const size = desktop ? frame : browserFrame(frame);
     const caps = cutCaptions(item);
     const lines = presentCues(
-      buildCues(captionWords(heard, caps), item.start, item.end),
+      buildCues(spokenWords(captionWords(heard, caps), item), item.start, item.end),
       caps.translation,
       item.start,
     );
@@ -1407,10 +1905,17 @@ export default function App() {
       ...exportFraming({ ...item, shape }, im.width, im.height),
       video: im.id,
       loudness: loudnessLufs(item),
-      drops: item.fillers ? fromStart(fillerRanges(heard, item.start, item.end), item.start) : [],
+      drops: fromStart(
+        mergeSpans([
+          ...(item.fillers ? fillerRanges(heard, item.start, item.end) : []),
+          ...(item.removed ?? []),
+        ]),
+        item.start,
+      ),
       zooms: item.punch ? fromStart(punchRanges(heard, item.start, item.end), item.start) : [],
       broll: brollRequest(cutBroll(item, projectVideos(p))),
       texts: textsRequest(cutTexts(item)),
+      cam: cutFit({ ...item, shape }) === 'stack' ? cutCam(item, im.width, im.height) : null,
       headline: (await headlinePng(size.width, size.height, item.headline ?? '')) ?? '',
       voice: cutVoice(item),
       music: track?.source ?? '',
@@ -1423,10 +1928,7 @@ export default function App() {
         caps.style !== 'none' && lines.length
           ? JSON.stringify({
               cues: lines,
-              style: caps.style,
-              position: caps.position,
-              color: caps.color,
-              highlight: caps.highlight,
+              ...captionLook(caps),
               top: caps.position === 'top' ? top : null,
               language: transcript?.language ?? null,
             })
@@ -1435,42 +1937,38 @@ export default function App() {
   }
   /** The selected clips, in bin order, as one video between the project's opening shot and end card. */
   async function exportingJoined(shape: Shape) {
-    await action('Rendering and joining your clips…', async () => {
+    await action('Adding to the render queue…', async () => {
       const ordered = p.cuts.filter((item) => batchIds.includes(item.id));
+      if (!ordered.length) return;
+      const title = `${ordered[0].title}${ordered.length > 1 ? ` + ${ordered.length - 1} more` : ''}`;
+      const target = await invoke<string | null>('pick_export_file', {
+        name: `joined-${ordered[0].title}`,
+      });
+      if (!target) return;
       const requests = [];
       for (const item of ordered) requests.push(await clipRequest(item, shape));
-      if (!requests.length) return;
       const intro = p.bookends?.intro;
       const outro = p.bookends?.outro;
-      const path = await invoke<string | null>('export_joined', {
-        id: p.id,
-        requests,
-        transition,
-        intro: intro?.path ?? null,
-        outro: outro?.path ?? null,
-      });
-      if (!path) return;
       const parts = ordered.length + Number(!!intro) + Number(!!outro);
       const length =
         ordered.reduce((sum, item) => sum + (item.end - item.start) / cutSpeed(item), 0) +
         (intro?.duration ?? 0) +
         (outro?.duration ?? 0) -
         (transition === 'cut' ? 0 : 0.5 * (parts - 1));
-      setEntries((prev) => [
-        {
-          id: newId(),
-          title: `${ordered[0]?.title ?? 'Clips'}${ordered.length > 1 ? ` + ${ordered.length - 1} more` : ''}`,
-          path,
-          duration: Math.max(0, length),
-          date: new Date().toISOString(),
-          project: p.title,
+      enqueue({
+        kind: 'joined',
+        title,
+        target,
+        args: {
+          id: p.id,
+          requests,
+          transition,
+          intro: intro?.path ?? null,
+          outro: outro?.path ?? null,
+          target,
         },
-        ...prev,
-      ]);
-      setModal(null);
-      setToast(
-        `${ordered.length} ${ordered.length === 1 ? 'clip' : 'clips'} joined into one video`,
-      );
+        duration: Math.max(0, length),
+      });
     });
   }
   /** Chooses, or clears, the project's opening shot or end card. */
@@ -1487,59 +1985,33 @@ export default function App() {
     }
   }
   async function exportingBatch(jobs: ExportJob[]) {
-    await action('Rendering your clips…', async () => {
+    await action('Adding to the render queue…', async () => {
+      const folder = await invoke<string | null>('pick_export_folder');
+      if (!folder) return;
       const requests = [];
       for (const job of jobs) {
         const item = p.cuts.find((entry) => entry.id === job.id);
         if (item) requests.push(await clipRequest(item, job.shape));
       }
       if (!requests.length) return;
-      const report = await invoke<{
-        folder: string | null;
-        total: number;
-        outputs: {
-          title: string;
-          path: string;
-          duration: number;
-          warning?: string | null;
-        }[];
-        failures: { title: string; error: string }[];
-        cancelled: boolean;
-      } | null>('export_batch', { id: p.id, requests });
-      if (!report) return;
-      if (!report.outputs.length) {
-        if (report.cancelled) return;
-        throw Error(report.failures[0]?.error || 'Nothing was exported.');
-      }
-      const savedAt = new Date().toISOString();
-      setEntries((prev) => [
-        ...report.outputs.map((output) => ({
-          id: newId(),
-          title: output.title,
-          path: output.path,
-          duration: output.duration,
-          date: savedAt,
-          project: p.title,
-        })),
-        ...prev,
-      ]);
-      setModal(null);
-      const failed = report.failures.length;
-      const done = report.cancelled
-        ? `Stopped after ${report.outputs.length} of ${report.total} files`
-        : failed
-          ? `${report.outputs.length} exported, ${failed} failed`
-          : `${report.outputs.length} clips exported to one folder`;
-      const warning = report.outputs.find((output) => output.warning)?.warning;
-      setToast(warning ? `${done}. ${warning}` : done);
+      enqueue({
+        kind: 'batch',
+        title: `${p.title}: ${requests.length} ${requests.length === 1 ? 'file' : 'files'}`,
+        target: folder,
+        args: { id: p.id, requests, folder },
+        duration: 0,
+      });
     });
   }
   const following = ['faces', 'speaker'].includes(cutFraming(cut));
   const placed = framedCrop(cut, m.width, m.height, time - cut.start);
   const crop = cropFrame({ shape: cut.shape, crop: placed }, m.width, m.height);
   const split = cut.shape !== 'source' && cutFit(cut) === 'split';
+  // The stacked layout: the facecam drawn in the top band, the video below cut to the gameplay (facecam.ts).
+  const stack = cut.shape !== 'source' && cutFit(cut) === 'stack';
   const band = cropBox(cut, m.width, m.height);
-  const view = split ? cropRect(band, placed, m.width, m.height) : crop;
+  const view = split || stack ? cropRect(band, placed, m.width, m.height) : crop;
+  const topShare = stack ? splitBand(crop.height) / crop.height : 0;
   const punched = within(punchSpans, time);
   const pixels = desktop ? crop : browserFrame(crop);
   const ratio = pixels.width / pixels.height;
@@ -1565,8 +2037,8 @@ export default function App() {
   const captions = cutCaptions(cut);
   // `captions` is rebuilt from cut.captions on every render, so the memos follow the stored value.
   const captionSource = useMemo(
-    () => captionWords(heard, captions).filter((word) => !(cut.fillers && isFiller(word.text))),
-    [heard, cut.captions, cut.fillers],
+    () => spokenWords(captionWords(heard, captions), cut),
+    [heard, cut.captions, cut.fillers, cut.removed],
   );
   const sourceCues = useMemo(
     () => buildCues(captionSource, cut.start, cut.end),
@@ -1676,6 +2148,27 @@ export default function App() {
         }}
         onShortcuts={() => open('keys')}
         onCommands={() => setPalette(true)}
+        queue={
+          <>
+            <BackgroundJob
+              job={
+                background ??
+                (busy && desktop && !modal ? { title: busy, since: busySince, step } : null)
+              }
+              cancel={() => invoke('cancel_job').catch((e) => setToast(errorText(e)))}
+            />
+            <RenderQueue
+              tasks={renders}
+              cancel={cancelRender}
+              remove={(task) => setRenders((prev) => prev.filter((item) => item.id !== task.id))}
+              clear={() =>
+                setRenders((prev) =>
+                  prev.filter((item) => item.status === 'queued' || item.status === 'running'),
+                )
+              }
+            />
+          </>
+        }
         onGuide={() => open('guide')}
         notice={setToast}
       >
@@ -1740,9 +2233,49 @@ export default function App() {
                   </span>
                 </div>
                 <div className="screen" onDoubleClick={toggleFullscreen}>
+                  {sequence && (
+                    <div className="sequence-bar" role="status">
+                      <ListVideo size={14} aria-hidden="true" />
+                      <span>
+                        <b>Joined preview</b> {sequenceLabel(sequence, p.cuts)}
+                      </span>
+                      <button
+                        type="button"
+                        className="text-btn"
+                        onClick={stopSequence}
+                        aria-label="Stop the joined preview"
+                      >
+                        <X size={13} aria-hidden="true" /> Stop
+                      </button>
+                    </div>
+                  )}
+                  {seam > 0 && sequence && (
+                    <i key={seam} className="sequence-seam" data-transition={transition} />
+                  )}
+                  {(() => {
+                    const item = sequence?.items[sequence.at];
+                    const bookend = item?.kind === 'bookend' ? p.bookends?.[item.end] : undefined;
+                    return bookend ? (
+                      <video
+                        key={`${item?.kind === 'bookend' ? item.end : ''}-${sequence?.at}`}
+                        className="sequence-bookend"
+                        src={fileSrc(bookend.path)}
+                        aria-label={
+                          item?.kind === 'bookend' && item.end === 'intro'
+                            ? 'Opening shot'
+                            : 'End card'
+                        }
+                        autoPlay
+                        playsInline
+                        muted={muted}
+                        onEnded={advanceSequence}
+                        onError={advanceSequence}
+                      />
+                    ) : null;
+                  })()}
                   {src && (
                     <div
-                      className={`stage${blur ? ' blur-fill' : cropped ? ' crop-fill' : ''}${split ? ' split-fill' : ''}`}
+                      className={`stage${blur ? ' blur-fill' : cropped ? ' crop-fill' : ''}${split ? ' split-fill' : ''}${stack ? ' stack-fill' : ''}`}
                       style={{
                         width: `min(100cqw, ${ratio * 100}cqh)`,
                         height: `min(100cqh, ${100 / ratio}cqw)`,
@@ -1758,7 +2291,11 @@ export default function App() {
                         <div
                           className="stage-face"
                           style={
-                            split ? { height: `${(band.height / crop.height) * 100}%` } : undefined
+                            split
+                              ? { height: `${(band.height / crop.height) * 100}%` }
+                              : stack
+                                ? { top: `${topShare * 100}%`, height: `${(1 - topShare) * 100}%` }
+                                : undefined
                           }
                         >
                           <video
@@ -1785,7 +2322,8 @@ export default function App() {
                                     v.currentTime >= item.start && v.currentTime < item.end - 0.02,
                                 );
                                 if (hit) v.currentTime = Math.min(hit.end, cut.end);
-                                if (loop && v.currentTime >= cut.end) v.currentTime = cut.start;
+                                if (loop && !sequenceRef.current && v.currentTime >= cut.end)
+                                  v.currentTime = cut.start;
                               }
                               setTime(v.currentTime);
                               syncMusic.current(v, !v.paused);
@@ -1811,6 +2349,16 @@ export default function App() {
                             }
                           />
                         </div>
+                        {stack && (
+                          <div className="stage-cam" style={{ height: `${topShare * 100}%` }}>
+                            <MirrorVideo
+                              source={video}
+                              playing={playing}
+                              time={time}
+                              region={cutCam(cut, m.width, m.height)}
+                            />
+                          </div>
+                        )}
                         {split && (
                           <div
                             className="stage-whole"
@@ -2008,6 +2556,17 @@ export default function App() {
               snap={snap}
               canSnapWords={edges.start.length > 0}
               setSnap={setSnap}
+              clips={p.cuts
+                .map((item, index) => ({ cut: item, index }))
+                .filter(({ cut: item }) => mediaOf(p, item).id === m.id)}
+              choose={select}
+              layers={clipLayers(cut, projectVideos(p))}
+              placeLayer={placeLayer}
+              openLayer={(layer) => {
+                setPanel('clips');
+                setToolAsk({ tool: layer.kind === 'text' ? 'text' : 'broll', at: Date.now() });
+              }}
+              skips={skipSpans}
             />
             <Inspector
               p={m}
@@ -2019,6 +2578,12 @@ export default function App() {
                 available: aiBlocked,
                 write: (list, tone) => void writePosts(list, tone),
               }}
+              ai={{
+                access: aiAccess,
+                options: suggestOptions,
+                callouts: aiCallouts,
+                spoken: saidWords.length > 0,
+              }}
               assistant={
                 <AssistantPanel
                   turns={turns[p.id] ?? []}
@@ -2027,6 +2592,13 @@ export default function App() {
                   ask={(text) => void askAssistant(text)}
                   undo={() => travel('undo')}
                   canUndo={canUndo}
+                  clip={cut.title}
+                  clipCount={p.cuts.length}
+                  show={(id) => {
+                    const target = p.cuts.find((item) => item.id === id);
+                    if (target) select(target);
+                  }}
+                  retry={(text) => void askAssistant(text)}
                 />
               }
               videoLabel={(item) => videoLabel(item)}
@@ -2037,6 +2609,9 @@ export default function App() {
               analyze={() => open('ai')}
               duplicate={duplicate}
               remove={remove}
+              move={moveCut}
+              toolAsk={toolAsk}
+              playInOrder={() => playInOrder(p.cuts.map((item) => item.id))}
               notice={setToast}
               faces={faceJobs[cut.id] ?? null}
               findFaces={(speaker) => void findFaces(speaker)}
@@ -2096,6 +2671,11 @@ export default function App() {
                   spoken={transcript?.language}
                   translating={translating}
                   onTranslate={(language, both) => void translateClip(language, both)}
+                  suggestKeywords={
+                    saidWords.length > 0 && (
+                      <AiSuggest label="Suggest keywords" ai={aiAccess} run={aiKeywords} />
+                    )
+                  }
                 />
               }
               transcript={
@@ -2116,7 +2696,26 @@ export default function App() {
                   onLanguage={(code) => setSpokenLanguage((prev) => ({ ...prev, [m.id]: code }))}
                   onTranscribe={(again) => void transcribe(m.id, again)}
                   onConnect={() => open('ai')}
+                  removed={cut.removed ?? []}
+                  onRemoved={(next) => update({ removed: next.length ? next : undefined })}
+                  tighten={<AiSuggest label="Tighten with AI" ai={aiAccess} run={aiTighten} />}
+                  suggested={suggested?.clip === cut.id ? suggested.cuts : []}
+                  onTake={(taken) => {
+                    update({ removed: takeCuts(cut.removed, taken) }, true);
+                    setSuggested((was) =>
+                      was
+                        ? { ...was, cuts: was.cuts.filter((item) => !taken.includes(item)) }
+                        : was,
+                    );
+                  }}
+                  onDismiss={() => setSuggested(null)}
                   onDownload={(kind) => void downloadTranscript(kind)}
+                  transcriber={transcriber}
+                  setTranscriber={(next) => {
+                    writeTranscriber(next);
+                    setTranscriberState(next);
+                    if (next) void transcribe(m.id, false, next);
+                  }}
                 />
               }
               pauseNote={
@@ -2145,11 +2744,36 @@ export default function App() {
           <ExportHistory entries={entries} onEdit={() => navigate('Clip editor')} />
         )}
       </StudioShell>
-      {palette && <CommandPalette commands={commands()} close={() => setPalette(false)} />}
+      {palette && (
+        <CommandPalette
+          commands={commands()}
+          close={() => setPalette(false)}
+          ask={
+            page === 'Clip editor' && !aiBlocked
+              ? (question) => {
+                  setPanel('assistant');
+                  void askAssistant(question);
+                }
+              : undefined
+          }
+        />
+      )}
       {toast && (
         <div className="toast" role="status">
           <Check size={16} />
           {toast}
+          {toast === undoFor && (
+            <button
+              type="button"
+              className="toast-action"
+              onClick={() => {
+                travel('undo');
+                setToast('');
+              }}
+            >
+              <Undo2 size={13} aria-hidden="true" /> Undo
+            </button>
+          )}
           <button className="icon-btn" aria-label="Dismiss message" onClick={() => setToast('')}>
             <X size={13} />
           </button>
@@ -2174,6 +2798,22 @@ export default function App() {
         >
           {modal === 'import' && (
             <>
+              {background && (
+                <div className="job-notice" role="status">
+                  <LoaderCircle className="spin" size={15} aria-hidden="true" />
+                  <span>
+                    <strong>Another job is running: {jobSummary(background)}.</strong> Importing can
+                    start once it finishes.
+                  </span>
+                  <button
+                    type="button"
+                    className="text-btn"
+                    onClick={() => invoke('cancel_job').catch((e) => setError(errorText(e)))}
+                  >
+                    Cancel it
+                  </button>
+                </div>
+              )}
               <div className="format-options import-into" role="group" aria-label="Import into">
                 {(
                   [
@@ -2191,6 +2831,7 @@ export default function App() {
                       }
                       className={into === value ? 'active' : ''}
                       aria-pressed={into === value}
+                      title={label}
                       onClick={() => setInto(value)}
                     >
                       <Icon size={15} aria-hidden="true" />
@@ -2301,7 +2942,12 @@ export default function App() {
               )}
             </>
           )}
-          {modal === 'ai' && <ProviderPanel busy={!!busy} analyze={analyze} />}
+          {modal === 'ai' &&
+            (moments ? (
+              <Moments moments={moments} add={addMoments} back={() => setMoments(null)} />
+            ) : (
+              <ProviderPanel busy={!!busy} analyze={analyze} />
+            ))}
           {modal === 'export' && (
             <>
               <p>Render the selected range with your output frame.</p>
@@ -2406,6 +3052,26 @@ export default function App() {
                 </p>
               )}
               {desktop && (
+                <button
+                  type="button"
+                  className="setting-toggle gpu-toggle"
+                  aria-labelledby="gpu-label"
+                  aria-describedby="gpu-note"
+                  aria-pressed={gpu}
+                  onClick={() => setGpu(!gpu)}
+                >
+                  <span className="settings-summary">
+                    <strong id="gpu-label">Encode on the graphics card</strong>
+                    <small id="gpu-note">
+                      {gpu
+                        ? 'Faster on NVIDIA, AMD, Intel and Apple chips. Falls back to the processor when the card can’t.'
+                        : 'Every export encodes on the processor: slower, the same on every computer.'}
+                    </small>
+                  </span>
+                  <span className="switch-track" aria-hidden="true" />
+                </button>
+              )}
+              {desktop && (
                 <div className="batch-export">
                   <span className="field-label">Clips and frames</span>
                   <div className="format-options join-options" role="group" aria-label="Export as">
@@ -2435,25 +3101,60 @@ export default function App() {
                   </div>
                   <p className="subnote" id="batch-note">
                     {joined
-                      ? 'The selected clips play in bin order as one video, each with its own settings, in one frame.'
+                      ? 'The selected clips play in this order as one video, each with its own settings, in one frame.'
                       : `Each selected clip is rendered in each selected frame, up to ${MAX_EXPORT_FILES} files in one folder.`}
                   </p>
-                  <div className="batch-clips" role="group" aria-label="Clips to export">
-                    {p.cuts.map((item) => (
-                      <label key={item.id}>
-                        <input
-                          type="checkbox"
-                          checked={batchIds.includes(item.id)}
-                          onChange={() =>
-                            setBatchIds((ids) =>
-                              ids.includes(item.id)
-                                ? ids.filter((id) => id !== item.id)
-                                : [...ids, item.id],
-                            )
-                          }
-                        />
-                        <span>{item.title}</span>
-                      </label>
+                  <div
+                    className={`batch-clips${joined ? ' ordered' : ''}`}
+                    role="group"
+                    aria-label="Clips to export"
+                  >
+                    {p.cuts.map((item, index) => (
+                      <div key={item.id} className="batch-clip">
+                        <label>
+                          <input
+                            type="checkbox"
+                            checked={batchIds.includes(item.id)}
+                            onChange={() =>
+                              setBatchIds((ids) =>
+                                ids.includes(item.id)
+                                  ? ids.filter((id) => id !== item.id)
+                                  : [...ids, item.id],
+                              )
+                            }
+                          />
+                          {joined && (
+                            <b className="batch-order" aria-hidden="true">
+                              {String(index + 1).padStart(2, '0')}
+                            </b>
+                          )}
+                          <span>{item.title}</span>
+                        </label>
+                        {joined && (
+                          <span className="batch-move">
+                            <button
+                              type="button"
+                              className="icon-btn"
+                              aria-label={`Play ${item.title} earlier`}
+                              title="Earlier"
+                              disabled={index === 0}
+                              onClick={() => moveCut(item.id, index - 1)}
+                            >
+                              <ChevronUp size={14} />
+                            </button>
+                            <button
+                              type="button"
+                              className="icon-btn"
+                              aria-label={`Play ${item.title} later`}
+                              title="Later"
+                              disabled={index === p.cuts.length - 1}
+                              onClick={() => moveCut(item.id, index + 1)}
+                            >
+                              <ChevronDown size={14} />
+                            </button>
+                          </span>
+                        )}
+                      </div>
                     ))}
                   </div>
                   <div
@@ -2552,6 +3253,16 @@ export default function App() {
                         })}
                       </div>
                     </>
+                  )}
+                  {joined && (
+                    <button
+                      type="button"
+                      className="btn secondary wide preview-joined"
+                      disabled={!batchIds.length}
+                      onClick={() => playInOrder(batchIds)}
+                    >
+                      <Play size={14} aria-hidden="true" /> Preview in order
+                    </button>
                   )}
                   {!joined && jobs.length > MAX_EXPORT_FILES && (
                     <p className="subnote">Choose {MAX_EXPORT_FILES} files or fewer.</p>

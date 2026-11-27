@@ -2,6 +2,8 @@ import type { CutCaptions } from './captions';
 import type { BRoll } from './broll';
 import type { TextLayer } from './texts';
 import type { Post } from './post';
+import type { CamBox } from './facecam';
+import type { Highlight } from './highlights';
 import { calmPath, cameraAt, type CameraPoint, type FaceSample } from './camera';
 import { convertFileSrc, invoke, isTauri } from '@tauri-apps/api/core';
 import {
@@ -34,7 +36,7 @@ export type Shape = keyof typeof FRAME_PRESETS;
  * `fill` crops to the output frame. `blur` keeps the whole picture on a darkened blurred copy. `split` (vertical frames)
  * puts a crop of the speaker's face on top and the whole picture below (ClipCheap's split layout).
  */
-export type Fit = 'fill' | 'blur' | 'split';
+export type Fit = 'fill' | 'blur' | 'split' | 'stack';
 /** Percentage of the available crop travel, measured from the left and top edges. */
 export type CropPosition = { x: number; y: number };
 export const CENTER_CROP: Readonly<CropPosition> = { x: 50, y: 50 };
@@ -79,7 +81,7 @@ export type Cut = {
   /** Burned-in captions from the clip's speech. Absent means none, so older clips stay as they were. */
   captions?: CutCaptions;
   /** Editorial notes from the AI's suggested range, not a forecast of performance. */
-  highlight?: { score?: number; reason?: string };
+  highlight?: Highlight;
   /** Cut its ums and uhs (polish.ts), from the transcript. Absent keeps every word. */
   fillers?: boolean;
   /** Zoom in on every other sentence (polish.ts), from the transcript. Absent keeps one framing. */
@@ -92,6 +94,10 @@ export type Cut = {
   texts?: TextLayer[];
   /** Post copy written for it (post.ts). */
   posts?: Post[];
+  /** Words cut from it in the transcript (textcut.ts), as spans of the source clock. */
+  removed?: [number, number][];
+  /** The facecam box of the stacked layout (facecam.ts), as shares of the source. */
+  cam?: CamBox;
 };
 export type CutLogo = {
   /** Desktop file path, or the browser blob id. */
@@ -109,7 +115,8 @@ export type CutMusic = MusicSettings & {
 };
 /** Saved cuts from before Fit existed stay on Fill, and a split on a frame that isn't tall becomes Fill. */
 export function cutFit(cut: Pick<Cut, 'fit'> & { shape?: Shape }): Fit {
-  if (cut.fit === 'split') return !cut.shape || splitShape(cut.shape) ? 'split' : 'fill';
+  if (cut.fit === 'split' || cut.fit === 'stack')
+    return !cut.shape || splitShape(cut.shape) ? cut.fit : 'fill';
   return cut.fit === 'blur' ? 'blur' : 'fill';
 }
 /** The split layout is for frames taller than wide. */
@@ -124,9 +131,21 @@ export function splitBand(frameHeight: number) {
 /** What the crop moves over the source: the output frame, or for the split layout its face band. */
 export function cropBox(cut: Pick<Cut, 'shape' | 'fit'>, width: number, height: number) {
   const frame = outputFrame(cut.shape, width, height);
-  return cut.shape !== 'source' && cutFit(cut) === 'split'
-    ? { width: frame.width, height: splitBand(frame.height) }
-    : frame;
+  if (cut.shape === 'source') return frame;
+  if (cutFit(cut) === 'stack') return gameBox(cut.shape, width, height);
+  return cutFit(cut) === 'split' ? { width: frame.width, height: splitBand(frame.height) } : frame;
+}
+/**
+ * The part of the source the stacked layout's gameplay shows, in source pixels: the largest in the shape of the frame
+ * under the facecam band (media.rs stack_filter's gw × gh).
+ */
+export function gameBox(shape: Shape, width: number, height: number) {
+  const frame = outputFrame(shape, width, height);
+  const bottom = frame.height - splitBand(frame.height);
+  const even = (n: number) => Math.max(2, Math.trunc(n / 2) * 2);
+  return width * bottom > height * frame.width
+    ? { width: even((height * frame.width) / bottom), height: even(height) }
+    : { width: even(width), height: even((width * bottom) / frame.width) };
 }
 /** A box placed on the source at a crop position, on even offsets like FFmpeg's 4:2:0 crop. */
 export function cropRect(
@@ -176,7 +195,14 @@ export function cutCamera(
 ): CameraPoint[] {
   const faces = cutFaces(cut);
   const framing = cutFraming(cut);
-  if (!following(framing) || cut.shape === 'source' || cutFit(cut) === 'blur' || !faces) return [];
+  if (
+    !following(framing) ||
+    cut.shape === 'source' ||
+    cutFit(cut) === 'blur' ||
+    cutFit(cut) === 'stack' ||
+    !faces
+  )
+    return [];
   const frame = cropBox(cut, width, height);
   return calmPath(
     faces.samples,
@@ -193,6 +219,8 @@ export function framedCrop(
   at = 0,
 ): CropPosition {
   const framing = cutFraming(cut);
+  // The stacked layout's gameplay is placed by hand; its facecam is its own box.
+  if (cut.shape !== 'source' && cutFit(cut) === 'stack') return cutCrop(cut);
   if (framing === 'center') return { ...CENTER_CROP };
   if (following(framing)) {
     const path = cutCamera(cut, width, height);
@@ -359,6 +387,14 @@ export type Video = Pick<
 /** The most videos one project holds (ClipCheap's 24 sources). */
 export const MAX_VIDEOS = 24;
 /** Every video in a project, the first one first. */
+/** The list with one item moved to another place (the clip bin's order, which a joined video plays in). */
+export function moveItem<T>(list: readonly T[], from: number, to: number): T[] {
+  const next = [...list];
+  if (from < 0 || from >= next.length) return next;
+  const [item] = next.splice(from, 1);
+  next.splice(Math.max(0, Math.min(next.length, to)), 0, item);
+  return next;
+}
 export function projectVideos(p: Project): Video[] {
   const { id, title, source, path, duration, width, height, fps, frames, wave, poster, fixes } = p;
   return [
@@ -514,8 +550,15 @@ export async function nativeImport(url?: string) {
     (Omit<Project, 'source' | 'cuts' | 'selected'> & { source?: string }) | null
   >(url ? 'import_youtube' : 'import_local', url ? { url, playable } : { playable });
   if (!media) return null;
+  return fromMedia(media, Boolean(url));
+}
+/** A project from what an import made (media.rs Media): a download says where it came from. */
+export function fromMedia(
+  media: Omit<Project, 'source' | 'cuts' | 'selected'> & { source?: string },
+  link = Boolean(media.source),
+) {
   const { source: reported, ...rest } = media;
-  const source = !url
+  const source = !link
     ? 'Local video'
     : reported === 'Twitch' || reported === 'Kick' || reported === 'YouTube'
       ? reported

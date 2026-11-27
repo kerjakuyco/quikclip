@@ -1,18 +1,23 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent } from 'react';
 import {
   AudioLines,
+  Clapperboard,
   Expand,
   Film,
+  Layers,
   ListVideo,
   Magnet,
   Plus,
   Scan,
   Scissors,
+  Type,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react';
 import { Select } from './Select';
 import { asset, clamp, clock, desktop, frame, type Cut, type Project } from '../studio';
+import { moveLayer, stackLayers, type LaneLayer } from '../lanes';
+import type { Span } from '../polish';
 import {
   boundView,
   fitClip,
@@ -25,6 +30,14 @@ import {
 } from '../timeline';
 
 type Edge = 'start' | 'end';
+/** A layer being dragged along the Layers lane. */
+type LayerDrag = {
+  pointer: number;
+  layer: LaneLayer;
+  origin: number;
+  secondsPerPixel: number;
+  moved: boolean;
+};
 type Drag = {
   pointer: number;
   mode: Edge | 'seek';
@@ -43,6 +56,12 @@ export function Timeline({
   snap,
   canSnapWords,
   setSnap,
+  clips = [],
+  choose,
+  layers = [],
+  placeLayer,
+  openLayer,
+  skips = [],
 }: {
   p: Project;
   cut: Cut;
@@ -53,6 +72,16 @@ export function Timeline({
   snap: TrimSnap;
   canSnapWords: boolean;
   setSnap: (snap: TrimSnap) => void;
+  /** Every clip cut from this video, with its place in the bin: the others show on the video track. */
+  clips?: { cut: Cut; index: number }[];
+  choose?: (c: Cut) => void;
+  /** The selected clip's text and b-roll, and moving one to a new time in the clip. */
+  layers?: LaneLayer[];
+  placeLayer?: (layer: LaneLayer, at: number) => void;
+  /** Opens a layer's settings (a double-click on it). */
+  openLayer?: (layer: LaneLayer) => void;
+  /** What the selected clip leaves out (pauses, ums, cut words), on the source clock. */
+  skips?: Span[];
 }) {
   const { duration } = p;
   const [view, setView] = useState<TimelineView>({ start: 0, span: duration });
@@ -60,6 +89,8 @@ export function Timeline({
   const [trimming, setTrimming] = useState<Edge | null>(null);
   const track = useRef<HTMLDivElement>(null);
   const drag = useRef<Drag | null>(null);
+  const layerDrag = useRef<LayerDrag | null>(null);
+  const [movingLayer, setMovingLayer] = useState<string | null>(null);
   const previousCut = useRef(cut.id);
   const canSnapFrames = Number.isFinite(p.fps) && p.fps > 0;
   const snapActive = snap === 'frames' ? canSnapFrames : snap === 'words' && canSnapWords;
@@ -116,6 +147,11 @@ export function Timeline({
   const ticks = useMemo(() => rulerTicks(view, width), [view, width]);
   const tiles = clamp(Math.ceil(width / 76), 4, 18);
   const clipIndex = p.cuts.findIndex((item) => item.id === cut.id) + 1;
+  const span = cut.end - cut.start;
+  const lane = useMemo(() => stackLayers(layers), [layers]);
+  const others = clips.filter(
+    ({ cut: c }) => c.id !== cut.id && c.end > view.start && c.start < viewEnd,
+  );
   const selectionLeft = atPercent(cut.start);
   const selection = atPercent(cut.end) - selectionLeft;
   const rangeText = `${clock(view.start, true)} to ${clock(viewEnd, true)}`;
@@ -158,6 +194,42 @@ export function Timeline({
     e.currentTarget.setPointerCapture(e.pointerId);
     if (mode === 'seek') move(e);
     else setTrimming(mode);
+  }
+  function grabLayer(e: PointerEvent<HTMLElement>, layer: LaneLayer) {
+    if (!e.isPrimary || e.button !== 0 || !placeLayer) return;
+    const rect = track.current!.getBoundingClientRect();
+    if (!rect.width) return;
+    e.stopPropagation();
+    layerDrag.current = {
+      pointer: e.pointerId,
+      layer,
+      origin: e.clientX,
+      secondsPerPixel: view.span / rect.width,
+      moved: false,
+    };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  }
+  function dragLayer(e: PointerEvent<HTMLElement>) {
+    const active = layerDrag.current;
+    if (!active || active.pointer !== e.pointerId) return;
+    e.stopPropagation();
+    const dx = e.clientX - active.origin;
+    if (!active.moved && Math.abs(dx) < 3) return;
+    if (!active.moved) setMovingLayer(active.layer.id);
+    active.moved = true;
+    placeLayer?.(
+      active.layer,
+      moveLayer(active.layer.at + dx * active.secondsPerPixel, active.layer.length, span),
+    );
+  }
+  function dropLayer(e: PointerEvent<HTMLElement>) {
+    const active = layerDrag.current;
+    if (!active || active.pointer !== e.pointerId) return;
+    e.stopPropagation();
+    layerDrag.current = null;
+    setMovingLayer(null);
+    // A press without a drag goes to where the layer starts.
+    if (!active.moved) seek(cut.start + active.layer.at);
   }
   function finish(e: PointerEvent<HTMLElement>) {
     if (drag.current?.pointer !== e.pointerId) return;
@@ -238,7 +310,7 @@ export function Timeline({
           </button>
         </div>
       </div>
-      <div className="timeline-body">
+      <div className="timeline-body" style={{ '--layer-rows': lane.rows } as CSSProperties}>
         <div className="track-labels" aria-hidden="true">
           <span className="track-ruler-label">Timecode</span>
           <span title="Video track">
@@ -250,6 +322,11 @@ export function Timeline({
             <AudioLines size={15} />
             <span>Audio</span>
             <small>A1</small>
+          </span>
+          <span title="Text and b-roll on the selected clip">
+            <Layers size={15} />
+            <span>Layers</span>
+            <small>L1</small>
           </span>
         </div>
         <div className="track-view">
@@ -308,6 +385,85 @@ export function Timeline({
                 <span role="status">Drawing the audio waveform…</span>
               ) : (
                 <span>Waveform unavailable</span>
+              )}
+            </div>
+            {others.map(({ cut: c, index }) => {
+              const left = atPercent(c.start);
+              const width_ = atPercent(c.end) - left;
+              const number = String(index + 1).padStart(2, '0');
+              return (
+                <div
+                  key={c.id}
+                  className="other-cut"
+                  style={{ left: `${left}%`, width: `${width_}%` }}
+                >
+                  {choose && (
+                    <button
+                      type="button"
+                      className="other-cut-tab"
+                      aria-label={`Select clip ${number}: ${c.title}`}
+                      title={`${c.title} · ${clock(c.start)} to ${clock(c.end)}`}
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={() => choose(c)}
+                    >
+                      {number}
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+            {skips
+              .filter(([a, b]) => b > view.start && a < viewEnd)
+              .map(([a, b]) => (
+                <i
+                  key={`${a}-${b}`}
+                  className="skip-span"
+                  aria-hidden="true"
+                  style={{ left: `${atPercent(a)}%`, width: `${atPercent(b) - atPercent(a)}%` }}
+                />
+              ))}
+            <div className="layer-lane" role="group" aria-label="Layers on this clip">
+              {layers.length === 0 ? (
+                <span className="layer-empty">Text and b-roll on this clip show here</span>
+              ) : (
+                lane.placed.map(({ layer, row }) => {
+                  const left = atPercent(cut.start + layer.at);
+                  const right = atPercent(cut.start + layer.at + layer.length);
+                  const Icon = layer.kind === 'text' ? Type : Clapperboard;
+                  const kind = layer.kind === 'text' ? 'text' : 'b-roll';
+                  return (
+                    <button
+                      key={layer.id}
+                      type="button"
+                      className={`layer-block ${layer.kind}${movingLayer === layer.id ? ' moving' : ''}`}
+                      style={
+                        {
+                          left: `${left}%`,
+                          width: `${Math.max(right - left, 0)}%`,
+                          '--layer-index': row,
+                        } as CSSProperties
+                      }
+                      aria-label={`Move ${kind} “${layer.label}”, ${layer.at.toFixed(1)} s into the clip`}
+                      title={`${layer.label} · drag to move, arrow keys to nudge, double-click for its settings`}
+                      onPointerDown={(e) => grabLayer(e, layer)}
+                      onDoubleClick={() => openLayer?.(layer)}
+                      onPointerMove={dragLayer}
+                      onPointerUp={dropLayer}
+                      onPointerCancel={dropLayer}
+                      onKeyDown={(e) => {
+                        if (!placeLayer || (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight'))
+                          return;
+                        e.preventDefault();
+                        e.stopPropagation();
+                        const step = (e.shiftKey ? 1 : 0.1) * (e.key === 'ArrowLeft' ? -1 : 1);
+                        placeLayer(layer, moveLayer(layer.at + step, layer.length, span));
+                      }}
+                    >
+                      <Icon size={11} aria-hidden="true" />
+                      <span>{layer.label}</span>
+                    </button>
+                  );
+                })
               )}
             </div>
             {selection > 0 && (

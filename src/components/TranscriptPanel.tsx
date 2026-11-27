@@ -1,5 +1,17 @@
-import { memo, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
-import { Check, Download, Pencil, Search } from 'lucide-react';
+import {
+  memo,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
+import { Check, Download, Pencil, Scissors, Search, Sparkles } from 'lucide-react';
+import type { SuggestedCut } from '../suggest';
+import { cutSeconds, cutWords, toggleWords } from '../textcut';
+import { TranscriberFields } from './TranscriberFields';
+import type { LocalTranscriber } from '../transcriber';
 import { Select } from './Select';
 import {
   TRANSLATE_LANGUAGES,
@@ -54,6 +66,9 @@ export type TranscriptStatus =
 
 type LineActions = {
   pick: (word: IndexedWord, extend: boolean) => void;
+  /** Cutting words: pressing on one, passing over others, and letting go. */
+  press: (word: IndexedWord) => void;
+  pass: (word: IndexedWord) => void;
   open: (index: number) => void;
   fix: (index: number, text: string) => void;
   close: () => void;
@@ -69,6 +84,10 @@ const Line = memo(function Line({
   editing,
   open,
   act,
+  cutting,
+  cutKey,
+  pendingKey,
+  suggestKey,
 }: {
   line: TranscriptLine;
   number: number;
@@ -78,7 +97,16 @@ const Line = memo(function Line({
   editing: boolean;
   open: number | null;
   act: LineActions;
+  /** Cutting words, with the line's cut words and the ones being dragged over, as comma lists (for memo). */
+  cutting: boolean;
+  cutKey: string;
+  pendingKey: string;
+  /** The line's words in a cut the AI suggested, as a comma list. */
+  suggestKey: string;
 }) {
+  const cut = new Set(cutKey ? cutKey.split(',').map(Number) : []);
+  const pending = new Set(pendingKey ? pendingKey.split(',').map(Number) : []);
+  const suggestedWords = new Set(suggestKey ? suggestKey.split(',').map(Number) : []);
   return (
     <li
       data-line={number}
@@ -104,12 +132,30 @@ const Line = memo(function Line({
               />
             ) : (
               <span
-                className={`word${word.index === spoken ? ' spoken' : ''}`}
+                className={`word${word.index === spoken ? ' spoken' : ''}${cut.has(word.index) ? ' cut' : ''}${pending.has(word.index) ? ' pending' : ''}${suggestedWords.has(word.index) ? ' suggested' : ''}`}
                 role="button"
                 tabIndex={-1}
                 data-start={word.start}
-                onClick={(e) => (editing ? act.open(word.index) : act.pick(word, e.shiftKey))}
-                onDoubleClick={() => act.open(word.index)}
+                aria-label={
+                  cut.has(word.index)
+                    ? `${word.text} (cut from the clip)`
+                    : suggestedWords.has(word.index)
+                      ? `${word.text} (suggested cut)`
+                      : undefined
+                }
+                onPointerDown={(e) => {
+                  if (cutting && e.button === 0) {
+                    e.preventDefault();
+                    act.press(word);
+                  }
+                }}
+                onPointerEnter={() => cutting && act.pass(word)}
+                onClick={(e) => {
+                  if (cutting) return;
+                  if (editing) act.open(word.index);
+                  else act.pick(word, e.shiftKey);
+                }}
+                onDoubleClick={() => !cutting && act.open(word.index)}
               >
                 {word.text}
               </span>
@@ -140,6 +186,14 @@ export function TranscriptPanel({
   onTranscribe,
   onConnect,
   onDownload,
+  transcriber,
+  setTranscriber,
+  removed,
+  onRemoved,
+  tighten,
+  suggested = [],
+  onTake,
+  onDismiss,
 }: {
   transcript: Transcript | undefined;
   fixes: TranscriptFixes | undefined;
@@ -159,10 +213,24 @@ export function TranscriptPanel({
   onConnect: () => void;
   /** Saves the transcript as text, or the whole video's subtitles. */
   onDownload: (kind: 'txt' | 'srt') => void;
+  /** A Whisper server on this computer, when one is used instead of the cloud. */
+  transcriber: LocalTranscriber | null;
+  setTranscriber: (transcriber: LocalTranscriber | null) => void;
+  /** The clip's words cut in the transcript, and changing them. */
+  removed: [number, number][];
+  onRemoved: (removed: [number, number][]) => void;
+  /** The AI's "Tighten" button, and the cuts it suggested, to take one by one or all at once. */
+  tighten?: ReactNode;
+  suggested?: SuggestedCut[];
+  onTake?: (cuts: SuggestedCut[]) => void;
+  onDismiss?: () => void;
 }) {
   const [query, setQuery] = useState('');
   const search = useDeferredValue(query.trim().toLowerCase());
   const [editing, setEditing] = useState(false);
+  // Cutting words from the clip: a run is chosen by pressing on a word and letting go on another.
+  const [cutting, setCutting] = useState(false);
+  const [drag, setDrag] = useState<{ from: number; to: number } | null>(null);
   const [open, setOpen] = useState<number | null>(null);
   const anchor = useRef<IndexedWord | null>(null);
   const list = useRef<HTMLOListElement>(null);
@@ -206,9 +274,35 @@ export function TranscriptPanel({
       ?.querySelector<HTMLElement>(`[data-line="${current}"]`)
       ?.scrollIntoView?.({ block: 'nearest' });
   }, [current, open, search]);
+  // The clip's own words, in order, and which of them are cut.
+  const clipWords = useMemo(
+    () =>
+      lines
+        .flatMap((line) => line.words)
+        .filter((word) => word.start >= clip.start - 0.01 && word.end <= clip.end + 0.01),
+    [lines, clip.start, clip.end],
+  );
+  const cutSet = useMemo(() => cutWords(clipWords, removed), [clipWords, removed]);
+  const inClipWord = useMemo(() => new Set(clipWords.map((word) => word.index)), [clipWords]);
+  const suggestedSet = useMemo(() => new Set(suggested.flatMap((item) => item.words)), [suggested]);
+  const wordText = useMemo(
+    () => new Map(clipWords.map((word) => [word.index, word.text])),
+    [clipWords],
+  );
   // The rows' actions, one stable object, always calling the latest handlers.
   const handlers = useRef({ onSeek, onRange, onFix });
   handlers.current = { onSeek, onRange, onFix };
+  const cutting_ = useRef({ inClipWord, setDrag });
+  cutting_.current = { inClipWord, setDrag };
+  useEffect(() => {
+    if (!drag) return;
+    const release = () => {
+      onRemoved(toggleWords(clipWords, removed, drag.from, drag.to));
+      setDrag(null);
+    };
+    window.addEventListener('pointerup', release, { once: true });
+    return () => window.removeEventListener('pointerup', release);
+  }, [drag, clipWords, removed, onRemoved]);
   const act = useMemo<LineActions>(
     () => ({
       pick: (word, extend) => {
@@ -220,6 +314,14 @@ export function TranscriptPanel({
         }
         anchor.current = word;
         handlers.current.onSeek(word.start);
+      },
+      press: (word) => {
+        if (cutting_.current.inClipWord.has(word.index))
+          cutting_.current.setDrag({ from: word.index, to: word.index });
+      },
+      pass: (word) => {
+        if (cutting_.current.inClipWord.has(word.index))
+          cutting_.current.setDrag((was) => (was ? { ...was, to: word.index } : was));
       },
       open: (index) => setOpen(index),
       fix: (index, text) => {
@@ -255,6 +357,7 @@ export function TranscriptPanel({
             <>
               <strong>The transcript stopped.</strong>
               <p className="caption-error">{status.text}</p>
+              {transcriber && <TranscriberFields transcriber={transcriber} save={setTranscriber} />}
               <SpokenLanguage value={language} onChange={onLanguage} />
               <button type="button" className="sound-toggle" onClick={() => onTranscribe(false)}>
                 Try again
@@ -264,12 +367,13 @@ export function TranscriptPanel({
             <>
               <strong>Connect a speech-to-text provider.</strong>
               <p>
-                Quikclip transcribes every video with Whisper on OpenRouter or Cloudflare, and every
-                clip gets its captions from the transcript.
+                Quikclip transcribes every video with Whisper, and every clip gets its captions from
+                the transcript: on OpenRouter or Cloudflare, or on this computer.
               </p>
               <button type="button" className="sound-toggle" onClick={onConnect}>
-                Open Highlight finder
+                Connect OpenRouter or Cloudflare
               </button>
+              <TranscriberFields transcriber={transcriber} save={setTranscriber} />
               <SpokenLanguage value={language} onChange={onLanguage} />
               <button type="button" className="text-btn" onClick={() => onTranscribe(false)}>
                 Transcribe now
@@ -307,23 +411,85 @@ export function TranscriptPanel({
         </label>
         <button
           type="button"
+          className={`text-btn${cutting ? ' active' : ''}`}
+          aria-pressed={cutting}
+          title="Click or drag over the clip's words to cut them out; again to bring them back"
+          onClick={() => {
+            setCutting(!cutting);
+            setEditing(false);
+            setOpen(null);
+          }}
+        >
+          {cutting ? <Check size={12} /> : <Scissors size={12} />}
+          {cutting ? 'Done cutting' : 'Cut words'}
+        </button>
+        <button
+          type="button"
           className={`text-btn${editing ? ' active' : ''}`}
           aria-pressed={editing}
           onClick={() => {
             setEditing(!editing);
+            setCutting(false);
             setOpen(null);
           }}
         >
           {editing ? <Check size={12} /> : <Pencil size={12} />}
           {editing ? 'Done' : 'Edit words'}
         </button>
+        {tighten}
       </div>
+      {suggested.length > 0 && (
+        <section className="ai-cuts" aria-label="Suggested cuts">
+          <div className="ai-cuts-head">
+            <strong>
+              <Sparkles size={13} aria-hidden="true" />
+              {suggested.length} suggested {suggested.length === 1 ? 'cut' : 'cuts'} ·{' '}
+              {cutSeconds(suggested.map((item) => item.span))} s
+            </strong>
+            <span>
+              <button type="button" className="text-btn" onClick={() => onTake?.(suggested)}>
+                <Scissors size={12} aria-hidden="true" /> Cut all
+              </button>
+              <button type="button" className="text-btn" onClick={onDismiss}>
+                Dismiss
+              </button>
+            </span>
+          </div>
+          <ol>
+            {suggested.map((item) => (
+              <li key={item.span.join('-')}>
+                <button
+                  type="button"
+                  className="ai-cut-words"
+                  title="Play from here"
+                  onClick={() => onSeek(item.span[0])}
+                >
+                  “{item.words.map((index) => wordText.get(index) ?? '').join(' ')}”
+                </button>
+                {item.why && <small>{item.why}</small>}
+                <button
+                  type="button"
+                  className="text-btn"
+                  aria-label={`Cut “${item.words.map((index) => wordText.get(index) ?? '').join(' ')}”`}
+                  onClick={() => onTake?.([item])}
+                >
+                  Cut
+                </button>
+              </li>
+            ))}
+          </ol>
+        </section>
+      )}
       <p className="transcript-hint" aria-live="polite">
-        {editing
-          ? 'Click a word to correct it. Enter saves, Esc cancels, and an empty word is dropped.'
-          : corrections
-            ? `${corrections} ${corrections === 1 ? 'word' : 'words'} corrected. Every clip's captions use them.`
-            : 'Misheard a word? Correct it here, and every clip’s captions follow.'}
+        {cutting
+          ? removed.length
+            ? `${cutSet.size} ${cutSet.size === 1 ? 'word' : 'words'} cut from the clip, ${cutSeconds(removed)} s. Click or drag over the clip’s words to cut more, or over cut ones to bring them back.`
+            : 'Click a word in the clip, or drag across several, to cut them out. The preview skips them, the export leaves them out, and so do the captions.'
+          : editing
+            ? 'Click a word to correct it. Enter saves, Esc cancels, and an empty word is dropped.'
+            : corrections
+              ? `${corrections} ${corrections === 1 ? 'word' : 'words'} corrected. Every clip's captions use them.`
+              : 'Misheard a word? Correct it here, and every clip’s captions follow.'}
       </p>
       {shown.length ? (
         <ol ref={list} className="transcript-lines" aria-label="Transcript">
@@ -338,6 +504,32 @@ export function TranscriptPanel({
               editing={editing}
               open={open !== null && line.words.some((w) => w.index === open) ? open : null}
               act={act}
+              cutting={cutting}
+              cutKey={line.words
+                .filter((word) => cutSet.has(word.index))
+                .map((word) => word.index)
+                .join(',')}
+              pendingKey={
+                drag
+                  ? line.words
+                      .filter(
+                        (word) =>
+                          word.index >= Math.min(drag.from, drag.to) &&
+                          word.index <= Math.max(drag.from, drag.to) &&
+                          inClipWord.has(word.index),
+                      )
+                      .map((word) => word.index)
+                      .join(',')
+                  : ''
+              }
+              suggestKey={
+                suggestedSet.size
+                  ? line.words
+                      .filter((word) => suggestedSet.has(word.index))
+                      .map((word) => word.index)
+                      .join(',')
+                  : ''
+              }
             />
           ))}
         </ol>
@@ -348,6 +540,11 @@ export function TranscriptPanel({
         Click a word to go there. Shift+click another to set the clip’s in and out. Marked lines are
         in the clip. Transcripts can have mistakes.
       </p>
+      {removed.length > 0 && (
+        <button type="button" className="text-btn" onClick={() => onRemoved([])}>
+          Bring back every cut word ({cutSeconds(removed)} s)
+        </button>
+      )}
       <div className="transcript-downloads">
         <button type="button" className="text-btn" onClick={() => onDownload('txt')}>
           <Download size={12} /> Transcript (.txt)

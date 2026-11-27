@@ -10,8 +10,14 @@ import {
   captionMoment,
   clearTranslation,
   editCue,
+  bareWord,
+  CAPTION_FONTS,
+  CAPTION_SCALES,
+  captionFont,
+  cleanKeywords,
   hasHighlight,
   isDark,
+  MAX_LIFT,
   languageName,
   paceCues,
   transcriptLines,
@@ -58,21 +64,31 @@ export function CaptionWords({
   time,
   captionStyle,
   style,
+  keywords,
 }: {
   cue: Cue;
   time: number;
   captionStyle: CaptionStyle;
   style?: CSSProperties;
+  /** Words lit up wherever they're said, bare. */
+  keywords?: readonly string[];
 }) {
   if (captionStyle === 'none') return null;
   const moment = captionMoment(cue, time);
+  const key = (text: string) =>
+    keywords?.length && keywords.includes(bareWord(text)) ? '' : undefined;
   if (captionStyle === 'pop') {
     return (
       <p key={moment.groupIndex} data-pop="" className="caption-pop" style={style}>
         <Lines
           items={moment.group}
           render={(word) => (
-            <span data-active={word.index === moment.active ? '' : undefined}>{word.text}</span>
+            <span
+              data-active={word.index === moment.active ? '' : undefined}
+              data-key={key(word.text)}
+            >
+              {word.text}
+            </span>
           )}
         />
       </p>
@@ -85,6 +101,7 @@ export function CaptionWords({
         render={(word, index) => (
           <span
             data-active={captionStyle === 'bold' && index === moment.active ? '' : undefined}
+            data-key={key(word.text)}
             style={
               captionStyle === 'karaoke'
                 ? ({ '--fill': `${Math.round(moment.fill[index] * 1000) / 10}%` } as CSSProperties)
@@ -117,6 +134,7 @@ function StyleSample({ style }: { style: CaptionStyle }) {
       </span>
     );
   if (style === 'clean') return <span className="style-sample style-sample-clean">Clean</span>;
+  if (style === 'boxed') return <span className="style-sample style-sample-boxed">Boxed</span>;
   return (
     <span className="style-sample style-sample-bold">
       Make <i>it</i>
@@ -154,18 +172,22 @@ export function LiveCaptions({
   const cue = paced.find((item) => time >= item.start && time < item.end);
   if (style === 'none' || !cue) return null;
   const metrics = captionMetrics(width, height, style);
+  const face = captionFont(captions);
   const colours = {
+    '--caption-face': face.family,
     '--caption-text': captions.color,
     '--caption-highlight': captions.highlight,
     '--caption-ink': isDark(captions.highlight) ? '#fff' : '#141414',
     '--caption-edge': isDark(captions.color) ? '#fff' : '#000',
     justifyContent: PLACE[captions.position],
   } as CSSProperties;
+  const lift = captions.lift ?? 0;
   const placed: CSSProperties = {
-    fontSize: `${(metrics.size / width) * 100}cqw`,
+    fontSize: `${((metrics.size * (captions.scale ?? 1) * face.scale) / width) * 100}cqw`,
     paddingInline: '6cqw',
-    paddingTop: captions.position === 'top' ? `${(top / height) * 100}cqh` : 0,
-    paddingBottom: captions.position === 'bottom' ? `${metrics.bottom * 100}cqh` : 0,
+    paddingTop: captions.position === 'top' ? `${Math.max(0, (top / height + lift) * 100)}cqh` : 0,
+    paddingBottom:
+      captions.position === 'bottom' ? `${Math.max(0, (metrics.bottom + lift) * 100)}cqh` : 0,
   };
   return (
     <div className="caption-stage" style={colours} lang={lang} aria-hidden="true">
@@ -176,7 +198,7 @@ export function LiveCaptions({
         className="caption-cue"
         style={placed}
       >
-        <CaptionWords cue={cue} time={time} captionStyle={style} />
+        <CaptionWords cue={cue} time={time} captionStyle={style} keywords={captions.keywords} />
         {cue.translation && <p className="caption-translation">{cue.translation}</p>}
       </div>
     </div>
@@ -338,6 +360,7 @@ export function CaptionFields({
   spoken,
   translating,
   onTranslate,
+  suggestKeywords,
 }: {
   cut: Cut;
   captions: CutCaptions;
@@ -352,8 +375,22 @@ export function CaptionFields({
   spoken?: string | null;
   translating: boolean;
   onTranslate: (language: string, both: boolean) => void;
+  /** The AI's pick of the words to light up, as a sparkle button (components/AiSuggest.tsx). */
+  suggestKeywords?: ReactNode;
 }) {
   const set = (next: Partial<CutCaptions>) => update({ captions: { ...captions, ...next } });
+  const [keywordText, setKeywordText] = useState((captions.keywords ?? []).join(', '));
+  useEffect(
+    () => setKeywordText((captions.keywords ?? []).join(', ')),
+    [cut.id, (captions.keywords ?? []).join(',')],
+  );
+  const commitKeywords = (text: string) => {
+    const keywords = cleanKeywords(text.split(/[,\n]/));
+    set({ keywords: keywords.length ? keywords : undefined });
+    setKeywordText(keywords.join(', '));
+  };
+  const scale = captions.scale ?? 1;
+  const lift = captions.lift ?? 0;
   const own = captions.words !== undefined;
   const translated = captions.translation;
   const [choice, setChoice] = useState<string>(
@@ -423,18 +460,98 @@ export function CaptionFields({
               </button>
             ))}
           </div>
+          <Select
+            className="select-field caption-font"
+            label="Font"
+            value={captionFont(captions).value}
+            onChange={(font) =>
+              set({ font: font === 'noto' ? undefined : (font as CutCaptions['font']) })
+            }
+            title={captionFont(captions).description}
+            options={CAPTION_FONTS.map((font) => ({ value: font.value, label: font.label }))}
+          />
+          <div className="caption-size-row">
+            <span className="field-label" id="caption-size-label">
+              Size
+            </span>
+            <div className="caption-size" role="group" aria-labelledby="caption-size-label">
+              {CAPTION_SCALES.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  className={Math.abs(scale - option.value) < 0.01 ? 'active' : ''}
+                  aria-pressed={Math.abs(scale - option.value) < 0.01}
+                  aria-label={`Caption size ${option.label}`}
+                  onClick={() => set({ scale: option.value === 1 ? undefined : option.value })}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          {captions.position !== 'middle' && (
+            <label className="caption-lift">
+              <span className="field-label">
+                {captions.position === 'top' ? 'Distance from the top' : 'Distance from the bottom'}
+                <output>
+                  {lift > 0 ? '+' : ''}
+                  {Math.round(lift * 100)}%
+                </output>
+              </span>
+              <input
+                type="range"
+                min={-MAX_LIFT / 3}
+                max={MAX_LIFT}
+                step={0.01}
+                value={lift}
+                style={
+                  {
+                    '--fill': `${((lift + MAX_LIFT / 3) / (MAX_LIFT + MAX_LIFT / 3)) * 100}%`,
+                  } as CSSProperties
+                }
+                aria-label="Caption distance from the edge"
+                onChange={(e) => {
+                  const next = Number(e.target.value);
+                  set({ lift: Math.abs(next) < 0.005 ? undefined : next });
+                }}
+              />
+            </label>
+          )}
           <Swatches
             label="Text color"
             value={captions.color}
             onChange={(color) => set({ color })}
           />
-          {hasHighlight(captions.style) && (
-            <Swatches
-              label="Highlight color"
-              value={captions.highlight}
-              onChange={(highlight) => set({ highlight })}
+          <Swatches
+            label={hasHighlight(captions.style) ? 'Highlight color' : 'Keyword color'}
+            value={captions.highlight}
+            onChange={(highlight) => set({ highlight })}
+          />
+          <div className="caption-keywords">
+            <div className="caption-keywords-head">
+              <label className="field-label" htmlFor="caption-keywords">
+                Keywords
+              </label>
+              {suggestKeywords}
+            </div>
+            <input
+              id="caption-keywords"
+              placeholder="Words to light up, separated by commas"
+              value={keywordText}
+              onChange={(e) => setKeywordText(e.target.value)}
+              onBlur={(e) => commitKeywords(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  commitKeywords(e.currentTarget.value);
+                }
+              }}
             />
-          )}
+            <small>
+              Lit in the {hasHighlight(captions.style) ? 'highlight' : 'keyword'} color, a little
+              larger, wherever they’re said.
+            </small>
+          </div>
           <section className="translate-card" aria-labelledby="caption-translate">
             <div className="translate-head">
               <span className="field-label" id="caption-translate">
