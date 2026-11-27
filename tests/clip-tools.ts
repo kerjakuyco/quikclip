@@ -1,13 +1,23 @@
 import type { Page } from '@playwright/test';
 
-export function clipTools(page: Page, section: string) {
+/** Which of the inspector's clip setting tabs holds each group of settings. */
+const TOOL_FOR: Record<string, string> = {
+  Frame: 'Frame',
+  Captions: 'Text',
+  'Text on video': 'Text',
+  'Headline and logo': 'Text',
+  Audio: 'Audio',
+  'B-roll': 'B-roll',
+  'Post copy': 'Post',
+};
+
+export function clipTool(page: Page, section: string) {
   return page
-    .getByRole('tabpanel', { name: 'Clips' })
-    .locator('summary')
-    .filter({ has: page.getByText(section, { exact: true }) });
+    .getByRole('tablist', { name: 'Clip settings' })
+    .getByRole('tab', { name: TOOL_FOR[section] ?? section, exact: true });
 }
 
+/** Shows the clip settings tab holding `section`. */
 export async function openClipTools(page: Page, section: string) {
-  const summary = clipTools(page, section);
-  if (!(await summary.evaluate((el) => el.closest('details')?.open))) await summary.click();
+  await clipTool(page, section).click();
 }

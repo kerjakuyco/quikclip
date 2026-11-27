@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { deflateSync } from 'node:zlib';
-import { stat } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { expect, test } from '@playwright/test';
 import { openClipTools } from './clip-tools';
 import { logoFit, pngSize } from '../src/logo';
@@ -14,6 +14,7 @@ import {
   silencesIn,
 } from '../src/pauses';
 import { cutSpeed, playedLength, SPEEDS, VoicePace } from '../src/speed';
+import type { Project } from '../src/studio';
 import {
   buildCues,
   captionMoment,
@@ -310,11 +311,13 @@ test('edit and persist a cut, then render the selected range', async ({ page }) 
   await page.getByLabel('In point', { exact: true }).press('Enter');
   await page.getByLabel('Out point', { exact: true }).fill('14.5');
   await page.getByLabel('Out point', { exact: true }).press('Enter');
+  await openClipTools(page, 'Frame');
   await page.getByRole('button', { name: '9:16', exact: true }).click();
   await page.getByRole('button', { name: 'Show the whole video', exact: true }).click();
   await openClipTools(page, 'Headline and logo');
   await page.getByLabel('Headline', { exact: true }).fill('Valley light');
   await page.getByLabel('Headline', { exact: true }).press('Enter');
+  await openClipTools(page, 'Audio');
   await page.getByRole('button', { name: 'Clearer voice', exact: true }).click();
   const musicRights = page.getByRole('checkbox', {
     name: 'I own this audio or have permission to use it.',
@@ -339,6 +342,7 @@ test('edit and persist a cut, then render the selected range', async ({ page }) 
     input.dispatchEvent(new Event('input', { bubbles: true }));
   });
   await expect(page.getByLabel('Music volume')).toHaveValue('40');
+  await openClipTools(page, 'Headline and logo');
   await expect(page.getByRole('button', { name: 'Add logo', exact: true })).toBeVisible();
   await page.getByLabel('Logo file').setInputFiles({
     name: 'mark.png',
@@ -370,6 +374,7 @@ test('edit and persist a cut, then render the selected range', async ({ page }) 
     expect.stringContaining(`left: ${moved.left * 100}%`),
   );
   await expect(shown).toHaveAttribute('style', expect.stringContaining(`top: ${moved.top * 100}%`));
+  await openClipTools(page, 'Frame');
   const speeds = page.getByRole('group', { name: 'Speed' });
   await expect(speeds.getByRole('button', { name: '1×', exact: true })).toHaveAttribute(
     'aria-pressed',
@@ -383,6 +388,7 @@ test('edit and persist a cut, then render the selected range', async ({ page }) 
   await expect
     .poll(() => page.locator('video').evaluate((v) => (v as HTMLVideoElement).playbackRate))
     .toBe(1.5);
+  await openClipTools(page, 'Audio');
   await page.getByRole('button', { name: 'Cut out pauses', exact: true }).click();
   await expect(page.locator('.pause-note')).toHaveText('No pauses in this moment', {
     timeout: 20_000,
@@ -399,9 +405,14 @@ test('edit and persist a cut, then render the selected range', async ({ page }) 
   ).toHaveAttribute('aria-pressed', 'true');
   await expect(page.locator('.stage.blur-fill')).toBeVisible();
   await openClipTools(page, 'Headline and logo');
-  await openClipTools(page, 'Audio');
   await expect(page.getByLabel('Headline', { exact: true })).toHaveValue('Valley light');
   await expect(page.locator('.headline')).toContainText('Valley light');
+  await expect(page.locator('.logo-name')).toHaveText('mark');
+  await expect(page.getByRole('button', { name: 'Bottom left', exact: true })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  );
+  await openClipTools(page, 'Audio');
   await expect(page.getByRole('button', { name: 'Clearer voice', exact: true })).toHaveAttribute(
     'aria-pressed',
     'true',
@@ -415,12 +426,8 @@ test('edit and persist a cut, then render the selected range', async ({ page }) 
   });
   await expect(page.locator('.music-name')).toHaveText('bed');
   await expect(page.getByLabel('Music volume')).toHaveValue('40');
-  await expect(page.locator('.logo-name')).toHaveText('mark');
-  await expect(page.getByRole('button', { name: 'Bottom left', exact: true })).toHaveAttribute(
-    'aria-pressed',
-    'true',
-  );
   await expect(page.locator('.stage .logo')).toHaveAttribute('data-logo-corner', 'bottom-left');
+  await openClipTools(page, 'Frame');
   await expect(
     page.getByRole('group', { name: 'Speed' }).getByRole('button', { name: '1.5×', exact: true }),
   ).toHaveAttribute('aria-pressed', 'true');
@@ -463,6 +470,7 @@ test('edit and persist a cut, then render the selected range', async ({ page }) 
   await page.getByLabel('In point', { exact: true }).press('Enter');
   await page.getByLabel('Out point', { exact: true }).fill('36');
   await page.getByLabel('Out point', { exact: true }).press('Enter');
+  await openClipTools(page, 'Audio');
   await expect(page.locator('.pause-note')).toHaveText(/1 pause marked, about/, {
     timeout: 20_000,
   });
@@ -474,6 +482,196 @@ test('edit and persist a cut, then render the selected range', async ({ page }) 
   expect((await stat((await shortened.path())!)).size).toBeGreaterThan(1000);
   await page.getByRole('button', { name: 'Exports', exact: true }).click();
   await expect(page.locator('.export-row').first()).toContainText('Into the valley');
+});
+
+test('duplicates all clip settings and keeps attachments until the last reference is removed', async ({
+  page,
+}) => {
+  await page.goto('/');
+  await page.waitForFunction(() => localStorage.getItem('quikclip.1.projects'));
+  await page.evaluate(() => {
+    const projects: Project[] = JSON.parse(localStorage.getItem('quikclip.1.projects')!);
+    Object.assign(projects[0].cuts[0], {
+      shape: 'vertical',
+      crop: { x: 71, y: 50 },
+      speed: 1.25,
+      voice: true,
+      headline: 'Alpine light',
+      captions: {
+        style: 'clean',
+        position: 'middle',
+        color: '#FFFFFF',
+        highlight: '#FFFF00',
+        words: [{ text: 'Ready.', start: 0, end: 0.5 }],
+        from: 0,
+        to: 12,
+        translation: { language: 'es', both: true, lines: [{ at: 0, line: 'Listo.' }] },
+      },
+    });
+    localStorage.setItem('quikclip.1.projects', JSON.stringify(projects));
+  });
+  await page.reload();
+  await openClipTools(page, 'Headline and logo');
+  await page.getByLabel('Logo file').setInputFiles({
+    name: 'shared.png',
+    mimeType: 'image/png',
+    buffer: pngLogo(),
+  });
+  await expect(page.locator('.logo-name')).toHaveText('shared');
+  await openClipTools(page, 'Audio');
+  await page.getByRole('checkbox', { name: /I own this audio/ }).check();
+  await page.getByLabel('Music file').setInputFiles({
+    name: 'shared.wav',
+    mimeType: 'audio/wav',
+    buffer: wavTone(),
+  });
+  await expect(page.locator('.music-name')).toHaveText('shared');
+
+  await page.getByRole('button', { name: 'Duplicate selected clip' }).click();
+  const cuts = page.getByRole('group', { name: 'Clips', exact: true });
+  const copy = cuts.getByRole('button', { name: /Above the clouds \(copy\)/ });
+  await expect(copy).toHaveAttribute('aria-pressed', 'true');
+  const [original, duplicated] = await page.evaluate(() =>
+    (JSON.parse(localStorage.getItem('quikclip.1.projects')!) as Project[])[0].cuts.slice(0, 2),
+  );
+  expect(duplicated).toEqual({
+    ...original,
+    id: expect.any(String),
+    title: 'Above the clouds (copy)',
+  });
+  expect(duplicated.id).not.toBe(original.id);
+
+  await openClipTools(page, 'Frame');
+  await page.getByRole('slider', { name: 'Horizontal crop position' }).press('Home');
+  await page.getByLabel('Out point', { exact: true }).fill('8.505');
+  await page.getByLabel('Out point', { exact: true }).press('Enter');
+  await openClipTools(page, 'Audio');
+  await page.getByRole('button', { name: 'Remove music', exact: true }).click();
+  await expect(page.locator('.music-name')).toHaveCount(0);
+
+  const first = cuts.getByRole('button', { name: /^Above the clouds 00:/ });
+  await first.click();
+  await expect(page.locator('.music-name')).toHaveText('shared');
+  await openClipTools(page, 'Frame');
+  await expect(page.getByRole('slider', { name: 'Horizontal crop position' })).toHaveValue('71');
+  await expect(page.getByLabel('Out point', { exact: true })).toHaveValue('00:12.00');
+  await copy.click();
+  await expect(page.getByLabel('Out point', { exact: true })).toHaveValue('00:08.505');
+  await page.getByRole('button', { name: 'Remove selected clip' }).click();
+  await expect(copy).toHaveCount(0);
+  await page.reload();
+  await expect(first).toHaveAttribute('aria-pressed', 'true');
+  await expect.poll(() => page.locator('.stage .logo').evaluate((el) => el.naturalWidth)).toBe(32);
+  await expect.poll(() => page.locator('audio').evaluate((el) => el.readyState)).toBeGreaterThan(0);
+
+  await page.getByRole('button', { name: 'Remove selected clip' }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        async (keys) => {
+          const db = await new Promise<IDBDatabase>((resolve, reject) => {
+            const request = indexedDB.open('quikclip-media', 3);
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error);
+          });
+          try {
+            return await Promise.all(
+              keys.map(
+                ([store, key]) =>
+                  new Promise((resolve, reject) => {
+                    const request = db.transaction(store).objectStore(store).getKey(key);
+                    request.onsuccess = () => resolve(Boolean(request.result));
+                    request.onerror = () => reject(request.error);
+                  }),
+              ),
+            );
+          } finally {
+            db.close();
+          }
+        },
+        [
+          ['music', original.music!.source],
+          ['logos', original.logo!.source],
+        ],
+      ),
+    )
+    .toEqual([false, false]);
+});
+
+test('persists the crop position and exports the same part of the frame to WebM', async ({
+  page,
+}) => {
+  await page.goto('/');
+  await page.getByLabel('In point', { exact: true }).fill('2');
+  await page.getByLabel('In point', { exact: true }).press('Enter');
+  await page.getByLabel('Out point', { exact: true }).fill('3');
+  await page.getByLabel('Out point', { exact: true }).press('Enter');
+  await page.getByRole('button', { name: '4:5', exact: true }).click();
+  const crop = page.getByRole('slider', { name: 'Horizontal crop position' });
+  await expect(crop).toHaveValue('50');
+  await crop.press('Home');
+  await page.getByRole('button', { name: 'Center crop' }).click();
+  await expect(crop).toHaveValue('50');
+  await crop.press('End');
+  await page.getByRole('button', { name: 'Show the whole video' }).click();
+  await expect(crop).toHaveCount(0);
+  await page.getByRole('button', { name: 'Fill the frame' }).click();
+  await page.reload();
+  await expect(crop).toHaveValue('100');
+  await expect(page.locator('.monitor-format')).toContainText('512 × 640');
+  const stage = (await page.locator('.stage').boundingBox())!;
+  const source = (await page.locator('.stage video').boundingBox())!;
+  expect((stage.x - source.x) / stage.width).toBeCloseTo(768 / 512, 2);
+  expect(source.width / stage.width).toBeCloseTo(1280 / 512, 2);
+
+  await page.getByRole('button', { name: 'Export clip', exact: true }).click();
+  const downloading = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Export WebM' }).click();
+  const file = await readFile((await (await downloading).path())!);
+  const result = await page.evaluate(async (encoded) => {
+    const preview = document.querySelector('video')!;
+    const out = document.createElement('video');
+    const bytes = Uint8Array.from(atob(encoded), (char) => char.charCodeAt(0));
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'video/webm' }));
+    const ready = new Promise<void>((resolve, reject) => {
+      out.onloadeddata = () => resolve();
+      out.onerror = () => reject(new Error('Could not decode the exported WebM'));
+    });
+    const seek = (el: HTMLVideoElement, at: number) =>
+      new Promise<void>((resolve) => {
+        el.addEventListener('seeked', () => resolve(), { once: true });
+        el.currentTime = at;
+      });
+    out.src = url;
+    try {
+      await ready;
+      await Promise.all([seek(out, 0.375), seek(preview, 2.375)]);
+      const canvas = document.createElement('canvas');
+      canvas.width = canvas.height = 24;
+      const ctx = canvas.getContext('2d')!;
+      ctx.imageSmoothingQuality = 'high';
+      function pixels(video: HTMLVideoElement, left: number) {
+        ctx.drawImage(video, left, 0, 512, 640, 0, 0, 24, 24);
+        return ctx.getImageData(0, 0, 24, 24).data;
+      }
+      const actual = pixels(out, 0);
+      const error = (left: number) =>
+        pixels(preview, left).reduce((sum, px, i) => sum + Math.abs(px - actual[i]), 0) /
+        actual.length;
+      return {
+        width: out.videoWidth,
+        height: out.videoHeight,
+        right: error(768),
+        center: error(384),
+      };
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }, file.toString('base64'));
+  expect([result.width, result.height]).toEqual([512, 640]);
+  // Allow for lossy re-encoding and decoder differences, but reject a fallback to a center crop.
+  expect(result.right, JSON.stringify(result)).toBeLessThan(16);
+  expect(result.right).toBeLessThan(result.center * 0.7);
 });
 
 test('import a real local file, reopen its saved bytes and play it', async ({ page }) => {
@@ -498,6 +696,90 @@ test('import a real local file, reopen its saved bytes and play it', async ({ pa
   await expect(page.locator('.cut-card')).toHaveCount(2);
   await page.getByRole('button', { name: 'Media library', exact: true }).click();
   await expect(page.locator('.library-card')).toHaveCount(2);
+});
+
+test('the audio mixer keeps its settings and exports a non-looping music bed over silent video', async ({
+  page,
+}) => {
+  await page.goto('/');
+  const silent = await page.evaluate(async (url) => {
+    const { Output, WebMOutputFormat, BufferTarget, CanvasSource } = await import(url);
+    const canvas = new OffscreenCanvas(240, 128);
+    const ctx = canvas.getContext('2d')!;
+    const target = new BufferTarget();
+    const output = new Output({ format: new WebMOutputFormat(), target });
+    const video = new CanvasSource(canvas, { codec: 'vp8', bitrate: 150000 });
+    output.addVideoTrack(video);
+    await output.start();
+    for (let i = 0; i < 10; i++) {
+      ctx.fillStyle = i % 2 ? '#30506a' : '#5c3d39';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      await video.add(i / 10, 0.1);
+    }
+    await output.finalize();
+    return Array.from(new Uint8Array(target.buffer!));
+  }, '/node_modules/mediabunny/dist/bundles/mediabunny.mjs');
+  await page.getByRole('button', { name: 'Import media', exact: true }).click();
+  await page.getByLabel('Video file').setInputFiles({
+    name: 'Testsilent.webm',
+    mimeType: 'video/webm',
+    buffer: Buffer.from(silent),
+  });
+  await expect(page.getByRole('heading', { name: 'Testsilent' })).toBeVisible();
+  await openClipTools(page, 'Audio');
+  await page.getByRole('checkbox', { name: /I own this audio/ }).check();
+  await page.getByLabel('Music file').setInputFiles({
+    name: 'tone.wav',
+    mimeType: 'audio/wav',
+    buffer: wavTone(),
+  });
+  await page.getByRole('slider', { name: 'Music volume' }).press('End');
+  await page.getByRole('slider', { name: 'Video volume' }).press('Home');
+  await page.getByRole('slider', { name: 'Fade in' }).press('Home');
+  await page.getByRole('slider', { name: 'Fade out' }).press('Home');
+  await page.getByLabel('Start in track').fill('0.1');
+  await page.getByLabel('Start in track').press('Enter');
+  await page.getByRole('checkbox', { name: 'Loop track' }).uncheck();
+
+  await page.reload();
+  await openClipTools(page, 'Audio');
+  await expect(page.getByLabel('Start in track')).toHaveValue('00:00.10');
+  await expect(page.getByRole('slider', { name: 'Fade in' })).toHaveValue('0');
+  await expect(page.getByRole('slider', { name: 'Fade out' })).toHaveValue('0');
+  await expect(page.getByRole('slider', { name: 'Music volume' })).toHaveValue('100');
+  await expect(page.getByRole('checkbox', { name: 'Loop track' })).not.toBeChecked();
+  await expect.poll(() => page.locator('video').evaluate((el) => el.volume)).toBe(0);
+  await page.getByRole('button', { name: 'Export clip', exact: true }).click();
+  const error = page.getByRole('dialog', { name: 'Export clip' }).getByRole('alert');
+  const download = Promise.race([
+    page.waitForEvent('download'),
+    error.waitFor({ state: 'visible' }).then(async () => {
+      throw Error((await error.textContent()) ?? 'Export failed');
+    }),
+  ]);
+  await page.getByRole('button', { name: 'Export WebM' }).click();
+  const file = await readFile((await (await download).path())!);
+  const levels = await page.evaluate(async (encoded) => {
+    const bytes = Uint8Array.from(atob(encoded), (c) => c.charCodeAt(0));
+    const ctx = new AudioContext();
+    try {
+      const audio = await ctx.decodeAudioData(bytes.buffer);
+      const lane = audio.getChannelData(0);
+      const rms = (from: number, to: number) => {
+        const part = lane.subarray(
+          Math.round(from * audio.sampleRate),
+          Math.round(to * audio.sampleRate),
+        );
+        return Math.sqrt(part.reduce((energy, n) => energy + n * n, 0) / part.length);
+      };
+      return { initial: rms(0.05, 0.18), afterOffset: rms(0.34, 0.38), tail: rms(0.58, 0.75) };
+    } finally {
+      await ctx.close();
+    }
+  }, file.toString('base64'));
+  expect(levels.initial).toBeGreaterThan(0.08);
+  expect(levels.afterOffset).toBeLessThan(0.02);
+  expect(levels.tail).toBeLessThan(0.01);
 });
 
 test('delete an imported project after confirming, keeping the last one', async ({ page }) => {
@@ -747,6 +1029,15 @@ test('every desktop video is transcribed and its clips get captions and a transc
             ],
             words,
           };
+        if (cmd === 'find_highlights')
+          return [
+            {
+              title: 'Look under the clouds',
+              start: 0.5,
+              end: 4.2,
+              highlight: { score: 86, reason: 'The opening sets up a clear visual payoff.' },
+            },
+          ];
         return null;
       },
     };
@@ -793,6 +1084,7 @@ test('every desktop video is transcribed and its clips get captions and a transc
   await page.goto('/');
   // Made automatically on opening, with the saved Cloudflare connection; the clip has captions from it.
   await openClipTools(page, 'Captions');
+  await page.getByRole('button', { name: "Edit this clip's lines" }).click();
   const lines = page.getByRole('list', { name: 'Caption lines' });
   await expect(lines.getByRole('listitem')).toHaveCount(2);
   const asked = await page.evaluate(() =>
@@ -807,7 +1099,7 @@ test('every desktop video is transcribed and its clips get captions and a transc
   await expect(page.locator('.caption-stage')).toHaveAttribute('lang', 'en');
   // The transcript: read it, go to a word, correct a misheard one for every clip, set the clip from a stretch of words.
   await page.getByRole('tab', { name: 'Transcript' }).click();
-  await expect(page.getByLabel('Spoken language')).toHaveValue('auto');
+  await expect(page.getByLabel('Spoken language')).toHaveAttribute('data-value', 'auto');
   const transcript = page.getByRole('list', { name: 'Transcript' });
   await expect(transcript.getByRole('listitem')).toHaveCount(2);
   await transcript.getByRole('button', { name: 'Clouds' }).click();
@@ -826,6 +1118,7 @@ test('every desktop video is transcribed and its clips get captions and a transc
   await page.getByRole('tab', { name: 'Clips' }).click();
   await expect(page.getByLabel('In point')).toHaveValue('00:01.00');
   await expect(page.getByLabel('Out point')).toHaveValue('00:04.20');
+  await page.getByRole('button', { name: "Edit this clip's lines" }).click();
   await expect(lines.locator('textarea').first()).toHaveValue('on summits.');
   // The whole video's subtitles and its transcript, saved as files, with the correction.
   await page.getByRole('tab', { name: 'Transcript' }).click();
@@ -846,7 +1139,51 @@ test('every desktop video is transcribed and its clips get captions and a transc
   // The correction is kept with the project.
   await page.reload();
   await openClipTools(page, 'Captions');
+  await page.getByRole('button', { name: "Edit this clip's lines" }).click();
   await expect(
     page.getByRole('list', { name: 'Caption lines' }).locator('textarea').first(),
   ).toHaveValue('on summits.');
+
+  const snap = page.getByRole('combobox', { name: 'Trim snapping' });
+  await snap.click();
+  await page.getByRole('option', { name: 'Words' }).click();
+  await page.locator('#timeline-title').click();
+  await page.locator('video').evaluate((v: HTMLVideoElement) => (v.currentTime = 1.56));
+  await expect(page.locator('.time-now')).toHaveText('00:01.56');
+  await page.keyboard.press('i');
+  await expect(page.getByLabel('In point', { exact: true })).toHaveValue('00:01.60');
+  await page.getByRole('button', { name: 'Drag clip start' }).press('ArrowRight');
+  await expect(page.getByLabel('In point', { exact: true })).toHaveValue('00:03.00');
+  await page.getByRole('button', { name: 'Drag clip start' }).press('Alt+ArrowRight');
+  await expect(page.getByLabel('In point', { exact: true })).toHaveValue('00:03.10');
+
+  await page.getByRole('button', { name: 'Find highlights', exact: true }).click();
+  const finder = page.getByRole('dialog', { name: 'Highlight finder' });
+  const count = finder.getByRole('group', { name: 'Maximum highlights' });
+  await count.getByRole('button', { name: '5', exact: true }).click();
+  await finder
+    .getByRole('group', { name: 'Maximum clip length' })
+    .getByRole('button', { name: '30 s' })
+    .click();
+  await finder.getByRole('button', { name: 'Analyze source' }).click();
+  await expect(finder).toBeHidden();
+  await expect(
+    page.getByRole('button', { name: /Look under the clouds.*86 out of 100/ }),
+  ).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.getByText('The opening sets up a clear visual payoff.')).toBeVisible();
+  const options = await page.evaluate(
+    () =>
+      (window as unknown as { __calls: [string, { options?: unknown }][] }).__calls.find(
+        ([cmd]) => cmd === 'find_highlights',
+      )?.[1].options,
+  );
+  expect(options).toEqual({ count: 5, maxSeconds: 30 });
+  await page.reload();
+  await expect(snap).toHaveAttribute('data-value', 'words');
+  await expect(page.getByText('The opening sets up a clear visual payoff.')).toBeVisible();
+  await page.getByRole('button', { name: 'Find highlights', exact: true }).click();
+  await expect(count.getByRole('button', { name: '5', exact: true })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  );
 });
