@@ -1,10 +1,15 @@
 mod ai;
+mod assistant;
 mod captions;
+mod faces;
 mod highlights;
 mod jobs;
+mod join;
 mod media;
+mod post;
 mod progress;
 mod providers;
+mod texts;
 mod transcript;
 mod translate;
 
@@ -29,6 +34,9 @@ pub fn run() {
             jobs::import_local,
             jobs::import_youtube,
             jobs::export_clip,
+            jobs::export_batch,
+            jobs::export_joined,
+            jobs::pick_bookend,
             jobs::find_pauses,
             jobs::delete_media,
             jobs::draw_wave,
@@ -41,6 +49,9 @@ pub fn run() {
             jobs::pick_logo,
             jobs::forget_logo,
             jobs::find_highlights,
+            faces::find_faces,
+            post::write_post_copy,
+            assistant::ask_assistant,
             jobs::cancel_job,
             providers::connect_ai,
             providers::forget_ai

@@ -13,6 +13,7 @@ use tokio::{
     fs,
     io::{AsyncBufReadExt, AsyncReadExt, BufReader},
     process::Command,
+    sync::watch,
     time::timeout,
 };
 use uuid::Uuid;
@@ -283,6 +284,24 @@ pub async fn probe(path: &Path) -> Result<(f64, u64, u64, f64, bool)> {
 }
 
 const IMPORT_SCALE: &str = "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1";
+/// HDR (PQ or HLG) tone-mapped to standard-range BT.709 before the editing scale, as clip-ai's
+/// assets step does for phone footage: shown as is, HDR looks grey and flat.
+const IMPORT_HDR: &str = "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p,scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1";
+
+/// A PQ (HDR10, Dolby Vision's base layer) or HLG video stream.
+fn hdr_video(data: &Value) -> bool {
+    data["streams"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|stream| stream["codec_type"] == "video")
+        .any(|stream| {
+            matches!(
+                stream["color_transfer"].as_str(),
+                Some("smpte2084" | "arib-std-b67")
+            )
+        })
+}
 
 struct ImportEncoder {
     /// Shown while importing.
@@ -384,6 +403,9 @@ fn import_plan(data: &Value, playable: Playable) -> CopyPlan {
     let Some(streams) = data["streams"].as_array() else {
         return CopyPlan::Transcode;
     };
+    if hdr_video(data) {
+        return CopyPlan::Transcode;
+    }
     let Some(video) = streams.iter().find(|stream| {
         stream["codec_type"] == "video" && stream["disposition"]["attached_pic"] != 1
     }) else {
@@ -450,9 +472,10 @@ fn upright(video: &Value) -> bool {
         })
 }
 
-async fn import_copy_plan(path: &Path, playable: Playable) -> CopyPlan {
+/// How to make the editing copy, and whether the source is HDR.
+async fn import_copy_plan(path: &Path, playable: Playable) -> (CopyPlan, bool) {
     let Ok(path) = text(path) else {
-        return CopyPlan::Transcode;
+        return (CopyPlan::Transcode, false);
     };
     let Ok(bytes) = run(
         "ffprobe",
@@ -471,11 +494,11 @@ async fn import_copy_plan(path: &Path, playable: Playable) -> CopyPlan {
     )
     .await
     else {
-        return CopyPlan::Transcode;
+        return (CopyPlan::Transcode, false);
     };
     serde_json::from_slice(&bytes)
-        .map(|data| import_plan(&data, playable))
-        .unwrap_or(CopyPlan::Transcode)
+        .map(|data| (import_plan(&data, playable), hdr_video(&data)))
+        .unwrap_or((CopyPlan::Transcode, false))
 }
 
 /// Apple's player only opens HEVC in MP4 tagged `hvc1`. Chromium plays either tag.
@@ -533,6 +556,7 @@ fn import_transcode_args<'a>(
     input: &'a str,
     output: &'a str,
     encoder: &'a ImportEncoder,
+    hdr: bool,
 ) -> Vec<&'a str> {
     let mut args = vec![
         "-v",
@@ -547,7 +571,7 @@ fn import_transcode_args<'a>(
         "-map",
         "0:a:0?",
         "-vf",
-        IMPORT_SCALE,
+        if hdr { IMPORT_HDR } else { IMPORT_SCALE },
         "-c:v",
         encoder.codec,
     ];
@@ -635,7 +659,8 @@ async fn ingest_into(
     let video = stage.path().join("source.mp4");
     let source = text(input)?;
     let copy = text(&video)?;
-    match import_copy_plan(input, playable).await {
+    let (plan, hdr) = import_copy_plan(input, playable).await;
+    match plan {
         CopyPlan::Stream(codec) => {
             let label = if codec == Codec::H264 {
                 "Copying video and audio (already editable, no re-encode)".to_string()
@@ -679,11 +704,16 @@ async fn ingest_into(
                     None,
                 );
             }
-            let software = format!("Re-encoding to H.264 with {}", SOFTWARE_ENCODER.name);
+            let verb = if hdr {
+                "Converting HDR to standard colour, H.264"
+            } else {
+                "Re-encoding to H.264"
+            };
+            let software = format!("{verb} with {}", SOFTWARE_ENCODER.name);
             if let Some(encoder) = hardware_encoder().await {
-                let label = format!("Re-encoding to H.264 with {}", encoder.name);
+                let label = format!("{verb} with {}", encoder.name);
                 if encode(
-                    &import_transcode_args(source, copy, encoder),
+                    &import_transcode_args(source, copy, encoder, hdr),
                     length,
                     &label,
                     track,
@@ -694,7 +724,7 @@ async fn ingest_into(
                     let _ = fs::remove_file(&video).await;
                     let label = format!("{} stopped. {software}", encoder.name);
                     encode(
-                        &import_transcode_args(source, copy, &SOFTWARE_ENCODER),
+                        &import_transcode_args(source, copy, &SOFTWARE_ENCODER, hdr),
                         length,
                         &label,
                         track,
@@ -703,7 +733,7 @@ async fn ingest_into(
                 }
             } else {
                 encode(
-                    &import_transcode_args(source, copy, &SOFTWARE_ENCODER),
+                    &import_transcode_args(source, copy, &SOFTWARE_ENCODER, hdr),
                     length,
                     &software,
                     track,
@@ -1106,44 +1136,215 @@ fn trunc_even(value: f64) -> u32 {
     ((value / 2.0).trunc() * 2.0).max(2.0) as u32
 }
 
-/// The center-crop frame for a shape, in source pixels. Same rounding as the fill `crop=` filter.
+/// The frame for a shape, in source pixels. Match `outputFrame` in studio.ts.
 pub fn frame_size(shape: &str, width: u64, height: u64) -> Result<(u32, u32)> {
     let (iw, ih) = (width as f64, height as f64);
-    match shape {
-        "vertical" => Ok((
-            trunc_even(iw.min(ih * 9.0 / 16.0)),
-            trunc_even(ih.min(iw * 16.0 / 9.0)),
-        )),
-        "square" => {
-            let side = trunc_even(iw.min(ih));
-            Ok((side, side))
-        }
-        _ => Err("Unknown aspect ratio.".into()),
+    let (w, h) = match shape {
+        "source" => return Ok((width.max(2) as u32, height.max(2) as u32)),
+        "landscape" => (16.0, 9.0),
+        "vertical" => (9.0, 16.0),
+        "square" => (1.0, 1.0),
+        "portrait" => (4.0, 5.0),
+        _ => return Err("Unknown aspect ratio.".into()),
+    };
+    Ok((
+        trunc_even(iw.min(ih * w / h)),
+        trunc_even(ih.min(iw * h / w)),
+    ))
+}
+
+#[derive(Clone, Copy, Deserialize)]
+pub struct CropPosition {
+    x: u8,
+    y: u8,
+}
+
+impl Default for CropPosition {
+    fn default() -> Self {
+        Self { x: 50, y: 50 }
     }
 }
 
-/// `fill` keeps the existing center crop. `blur` is clip-ai `render_filters` with `fit == "blur"`:
-/// the whole picture, scaled to fit, over a darkened blurred cover of the same frame.
-pub fn clip_filter(shape: &str, fit: &str, width: u64, height: u64) -> Result<String> {
+/// One point on the calm camera, in seconds from the clip's in point and crop travel (0–100).
+#[derive(Clone, Copy, Deserialize)]
+pub struct CropKey {
+    pub t: f64,
+    pub x: f64,
+    pub y: f64,
+}
+
+fn position_expr(keys: &[(f64, f64)]) -> String {
+    let mut expr = format!("{:.4}", keys.last().map(|key| key.1).unwrap_or(50.0));
+    for pair in keys.windows(2).rev() {
+        let (t0, v0) = pair[0];
+        let (t1, v1) = pair[1];
+        let piece = if (t1 - t0).abs() < 1e-4 {
+            format!("{v0:.4}")
+        } else {
+            let slope = (v1 - v0) / (t1 - t0);
+            format!("{v0:.4}+{slope:.6}*(t-{t0:.4})")
+        };
+        expr = format!("if(lt(t,{t1:.4}),{piece},{expr})");
+    }
+    expr
+}
+
+fn pixel_expr(travel: u64, position: &str) -> String {
+    if travel == 0 {
+        "0".into()
+    } else {
+        format!("trunc(({travel}*{position})/200)*2")
+    }
+}
+
+fn camera_keys(keys: &[CropKey]) -> Vec<CropKey> {
+    let mut sorted: Vec<CropKey> = keys
+        .iter()
+        .copied()
+        .filter(|key| key.t.is_finite() && key.x.is_finite() && key.y.is_finite())
+        .map(|key| CropKey {
+            t: key.t.max(0.0),
+            x: key.x.clamp(0.0, 100.0),
+            y: key.y.clamp(0.0, 100.0),
+        })
+        .collect();
+    sorted.sort_by(|a, b| a.t.total_cmp(&b.t));
+    if sorted.len() > 240 {
+        let last = sorted.len() - 1;
+        let stride = sorted.len().div_ceil(240);
+        sorted = sorted
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| index % stride == 0 || *index == last)
+            .map(|(_, key)| key)
+            .collect();
+    }
+    sorted
+}
+
+/// A `box_w` × `box_h` crop of the source that moves along the camera keys.
+fn moving_box(box_w: u32, box_h: u32, width: u64, height: u64, keys: &[CropKey]) -> String {
+    let x_keys: Vec<(f64, f64)> = keys.iter().map(|key| (key.t, key.x)).collect();
+    let y_keys: Vec<(f64, f64)> = keys.iter().map(|key| (key.t, key.y)).collect();
+    let x = pixel_expr(
+        width.saturating_sub(u64::from(box_w)),
+        &position_expr(&x_keys),
+    );
+    let y = pixel_expr(
+        height.saturating_sub(u64::from(box_h)),
+        &position_expr(&y_keys),
+    );
+    // crop evaluates x and y on every frame by itself; it has no `eval` option.
+    format!("crop={box_w}:{box_h}:x='{x}':y='{y}'")
+}
+
+/// A filled frame (or a split layout's face band) that follows the calm camera. `t` is the source
+/// clock after `-ss`, so this filter has to run before pause removal resets timestamps.
+pub fn moving_crop(
+    shape: &str,
+    fit: &str,
+    width: u64,
+    height: u64,
+    keys: &[CropKey],
+) -> Result<String> {
     if shape == "source" {
         return Ok("setsar=1".into());
     }
+    let keys = camera_keys(keys);
+    if keys.len() < 2 {
+        return Err("The camera path needs at least two points.".into());
+    }
+    let (frame_w, frame_h) = frame_size(shape, width, height)?;
+    if fit == "split" {
+        if frame_h <= frame_w {
+            return Err(SPLIT_SHAPE.into());
+        }
+        let face = moving_box(frame_w, split_band(frame_h), width, height, &keys);
+        return Ok(split_filter(&face, frame_w, frame_h));
+    }
+    Ok(format!(
+        "{},setsar=1",
+        moving_box(frame_w, frame_h, width, height, &keys)
+    ))
+}
+
+/// The split layout's face band: the top 42% of a vertical frame (clip-ai `SPLIT_TOP`), even.
+pub const SPLIT_TOP: f64 = 0.42;
+const SPLIT_SHAPE: &str = "The split layout is for vertical frames.";
+pub fn split_band(frame_h: u32) -> u32 {
+    even(f64::from(frame_h) * SPLIT_TOP)
+}
+
+/// clip-ai's split layout: the face band (`face`, a crop of the source) on top and the whole
+/// picture below, here over a darkened blurred copy of itself as the `blur` fit draws it.
+fn split_filter(face: &str, frame_w: u32, frame_h: u32) -> String {
+    let top = split_band(frame_h);
+    let bottom = frame_h - top;
+    let (small_w, small_h) = (even(frame_w as f64 / 4.0), even(bottom as f64 / 4.0));
+    let radius = 10.min(small_w.min(small_h) / 4);
+    format!(
+        "split[facesrc][mainsrc];[facesrc]{face}[face];[mainsrc]split[bgsrc][fgsrc];[bgsrc]scale={small_w}:{small_h}:force_original_aspect_ratio=increase,crop={small_w}:{small_h},boxblur={radius}:2,scale={frame_w}:{bottom},eq=brightness=-0.18[bg];[fgsrc]scale={frame_w}:{bottom}:force_original_aspect_ratio=decrease:flags=lanczos[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2[main];[face][main]vstack,setsar=1"
+    )
+}
+
+/// `fill` crops to the saved position. `blur` is clip-ai `render_filters` with `fit == "blur"`:
+/// the whole picture, scaled to fit, over a darkened blurred cover of the same frame.
+pub fn clip_filter(
+    shape: &str,
+    fit: &str,
+    width: u64,
+    height: u64,
+    crop: CropPosition,
+) -> Result<String> {
+    if shape == "source" {
+        return Ok("setsar=1".into());
+    }
+    let (frame_w, frame_h) = frame_size(shape, width, height)?;
     if fit.is_empty() || fit == "fill" {
-        return Ok(match shape {
-            "vertical" => {
-                "crop=w='trunc(min(iw,ih*9/16)/2)*2':h='trunc(min(ih,iw*16/9)/2)*2',setsar=1".into()
-            }
-            "square" => "crop='trunc(min(iw,ih)/2)*2':'trunc(min(iw,ih)/2)*2',setsar=1".into(),
-            _ => return Err("Unknown aspect ratio.".into()),
-        });
+        if crop.x > 100 || crop.y > 100 {
+            return Err("Crop position must be between 0% and 100%.".into());
+        }
+        // Match cropFrame in studio.ts, including FFmpeg's even alignment for 4:2:0.
+        let offset = |source: u64, frame: u32, position: u8| {
+            source
+                .saturating_sub(u64::from(frame))
+                .saturating_mul(u64::from(position))
+                / 200
+                * 2
+        };
+        let x = offset(width, frame_w, crop.x);
+        let y = offset(height, frame_h, crop.y);
+        return Ok(format!("crop={frame_w}:{frame_h}:{x}:{y},setsar=1"));
+    }
+    if fit == "split" {
+        if frame_h <= frame_w {
+            return Err(SPLIT_SHAPE.into());
+        }
+        if crop.x > 100 || crop.y > 100 {
+            return Err("Crop position must be between 0% and 100%.".into());
+        }
+        let top = split_band(frame_h);
+        let offset = |source: u64, size: u32, position: u8| {
+            source
+                .saturating_sub(u64::from(size))
+                .saturating_mul(u64::from(position))
+                / 200
+                * 2
+        };
+        let face = format!(
+            "crop={frame_w}:{top}:{}:{}",
+            offset(width, frame_w, crop.x),
+            offset(height, top, crop.y)
+        );
+        return Ok(split_filter(&face, frame_w, frame_h));
     }
     if fit != "blur" {
         return Err("Unknown fit.".into());
     }
-    let (frame_w, frame_h) = frame_size(shape, width, height)?;
     let (small_w, small_h) = (even(frame_w as f64 / 4.0), even(frame_h as f64 / 4.0));
+    let radius = 10.min(small_w.min(small_h) / 4);
     Ok(format!(
-        "split[bgsrc][fgsrc];[bgsrc]scale={small_w}:{small_h}:force_original_aspect_ratio=increase,crop={small_w}:{small_h},boxblur=10:2,scale={frame_w}:{frame_h},eq=brightness=-0.18[bg];[fgsrc]scale={frame_w}:{frame_h}:force_original_aspect_ratio=decrease:flags=lanczos[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1"
+        "split[bgsrc][fgsrc];[bgsrc]scale={small_w}:{small_h}:force_original_aspect_ratio=increase,crop={small_w}:{small_h},boxblur={radius}:2,scale={frame_w}:{frame_h},eq=brightness=-0.18[bg];[fgsrc]scale={frame_w}:{frame_h}:force_original_aspect_ratio=decrease:flags=lanczos[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1"
     ))
 }
 
@@ -1263,6 +1464,117 @@ fn format_rate(rate: f64) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// Spans on the clip clock: inside the clip, in order, overlapping ones merged, empty ones gone.
+fn clip_spans(spans: &[(f64, f64)], span: f64) -> Vec<(f64, f64)> {
+    let mut list: Vec<(f64, f64)> = spans
+        .iter()
+        .filter(|(a, b)| a.is_finite() && b.is_finite())
+        .map(|&(a, b)| (a.max(0.0), b.min(span)))
+        .filter(|(a, b)| b - a > 0.01)
+        .take(2000)
+        .collect();
+    list.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut merged: Vec<(f64, f64)> = Vec::new();
+    for (a, b) in list {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 + 0.01 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    merged
+}
+
+/// What stays once `drops` (filler words, clip clock) are cut too: the silence keeps, or the whole
+/// clip, less each drop. `kept` comes back unchanged when the drops would remove nothing or almost
+/// everything.
+pub fn without_drops(
+    kept: Option<Vec<(f64, f64)>>,
+    drops: &[(f64, f64)],
+    span: f64,
+) -> Option<Vec<(f64, f64)>> {
+    let drops = clip_spans(drops, span);
+    if drops.is_empty() {
+        return kept;
+    }
+    let base = kept.clone().unwrap_or_else(|| vec![(0.0, round3(span))]);
+    let before: f64 = base.iter().map(|(a, b)| b - a).sum();
+    let mut out = Vec::new();
+    for &(start, end) in &base {
+        let mut at = start;
+        for &(a, b) in &drops {
+            if b <= at || a >= end {
+                continue;
+            }
+            if a > at {
+                out.push((round3(at), round3(a)));
+            }
+            at = at.max(b);
+        }
+        if end > at {
+            out.push((round3(at), round3(end)));
+        }
+    }
+    out.retain(|(a, b)| b - a > 0.04);
+    let after: f64 = out.iter().map(|(a, b)| b - a).sum();
+    if out.is_empty() || after < 0.25 || before - after < 0.05 {
+        return kept;
+    }
+    Some(out)
+}
+
+/// Clip-clock spans on the exported clock: through the kept ranges, then the speed.
+pub fn played_spans(
+    spans: &[(f64, f64)],
+    kept: Option<&[(f64, f64)]>,
+    span: f64,
+    speed: f64,
+) -> Vec<(f64, f64)> {
+    let spans = clip_spans(spans, span);
+    let mut moved = Vec::new();
+    match kept {
+        None => moved = spans,
+        Some(pieces) => {
+            for (a, b) in spans {
+                let mut offset = 0.0;
+                for &(start, end) in pieces {
+                    let (from, to) = (a.max(start), b.min(end));
+                    if to > from {
+                        moved.push((offset + from - start, offset + to - start));
+                    }
+                    offset += end - start;
+                }
+            }
+        }
+    }
+    let speed = clip_speed(speed);
+    clip_spans(&moved, f64::INFINITY)
+        .into_iter()
+        .map(|(a, b)| (round3(a / speed), round3(b / speed)))
+        .filter(|(a, b)| b - a > 0.05)
+        .collect()
+}
+
+/// clip-clients polish.ts punch-ins: the picture scaled up 1.2× around its centre while `zooms`
+/// (on the exported clock) play. Runs after the speed change and before captions, which stay put.
+pub const PUNCH_ZOOM: f64 = 1.2;
+pub fn punch_filter(frame_w: u32, frame_h: u32, zooms: &[(f64, f64)]) -> Option<String> {
+    if zooms.is_empty() {
+        return None;
+    }
+    let (w, h) = (
+        trunc_even(f64::from(frame_w) / PUNCH_ZOOM),
+        trunc_even(f64::from(frame_h) / PUNCH_ZOOM),
+    );
+    let enable = zooms
+        .iter()
+        .map(|(a, b)| format!("between(t,{a:.3},{b:.3})"))
+        .collect::<Vec<_>>()
+        .join("+");
+    Some(format!(
+        "split[plain][near];[near]crop={w}:{h},scale={frame_w}:{frame_h}:flags=lanczos,setsar=1[punch];[plain][punch]overlay=0:0:enable='{enable}'"
+    ))
 }
 
 /// clip-ai `keep_select` for video: constant frame rate, then close the gaps by frame count.
@@ -1450,19 +1762,110 @@ fn gain(value: f64) -> String {
     }
 }
 
-/// The clip's sound with music, from the video (input 0) and the track (`music_input`, read with `-stream_loop -1`)
-/// to `[aout]`. Loudness is applied only on this mix, matching clip-ai `music_graph`.
+#[derive(Clone, Copy, Deserialize)]
+#[serde(default)]
+pub struct MusicMix {
+    pub volume: f64,
+    source_volume: f64,
+    fade_in: f64,
+    fade_out: f64,
+    #[serde(rename = "loop")]
+    repeat: bool,
+    start: f64,
+    /// Dip under speech: a sidechain compressor keyed by the clip's sound (clip-ai compose.py).
+    duck: bool,
+}
+
+impl Default for MusicMix {
+    fn default() -> Self {
+        Self {
+            volume: 0.2,
+            source_volume: 1.0,
+            fade_in: 0.5,
+            fade_out: 1.0,
+            repeat: true,
+            start: 0.0,
+            duck: false,
+        }
+    }
+}
+
+impl MusicMix {
+    pub fn with_volume(volume: f64) -> Self {
+        Self {
+            volume,
+            ..Self::default()
+        }
+    }
+
+    fn bounded(self) -> Self {
+        let defaults = Self::default();
+        let limit = |n: f64, fallback, max| {
+            if n.is_finite() {
+                n.clamp(0.0, max)
+            } else {
+                fallback
+            }
+        };
+        Self {
+            volume: limit(self.volume, defaults.volume, 1.0),
+            source_volume: limit(self.source_volume, defaults.source_volume, 1.0),
+            fade_in: limit(self.fade_in, defaults.fade_in, 5.0),
+            fade_out: limit(self.fade_out, defaults.fade_out, 5.0),
+            start: limit(self.start, 0.0, MAX_MUSIC_SECONDS),
+            ..self
+        }
+    }
+}
+
+/// Standard −16, Loud −14, Louder −11. Anything else is refused so an old export is unchanged.
+pub fn loudness_level(level: Option<i32>) -> Result<Option<i32>> {
+    match level {
+        None => Ok(None),
+        Some(level) if matches!(level, -16 | -14 | -11) => Ok(Some(level)),
+        Some(_) => Err("Unknown loudness.".into()),
+    }
+}
+
+fn loudnorm(level: i32) -> String {
+    format!("loudnorm=I={level}:TP=-1.5:LRA=11")
+}
+
+/// Append loudnorm on a voice-only export. `None` leaves the chain untouched.
+fn with_loudness(chain: Option<String>, level: Option<i32>) -> Option<String> {
+    let Some(level) = level else {
+        return chain;
+    };
+    let norm = loudnorm(level);
+    Some(match chain {
+        Some(rest) if !rest.is_empty() => format!("{rest},{norm}"),
+        _ => norm,
+    })
+}
+
+/// The clip's sound with music, from the video (input 0) and the track (`music_input`)
+/// to `[aout]`. Without a chosen loudness the mix stays at −16 LUFS, matching older exports.
 pub fn music_graph(
     voice: Option<&str>,
-    volume: f64,
+    mix: MusicMix,
     length: f64,
     music_input: usize,
     source_audio: bool,
+    loudness: Option<i32>,
 ) -> String {
-    let fade_in = 0.5_f64.min(length / 2.0).max(0.0);
-    let fade_out = 1.0_f64.min(length / 2.0).max(0.0);
+    let MusicMix {
+        volume,
+        source_volume,
+        fade_in,
+        fade_out,
+        start,
+        duck,
+        ..
+    } = mix.bounded();
+    let fade_in = fade_in.min(length / 2.0);
+    let fade_out = fade_out.min(length / 2.0);
     let mut track = format!(
-        "atrim=start=0.000,asetpts=PTS-STARTPTS,atrim=duration={length:.3},aresample=48000,volume={}",
+        "atrim=start={start:.3},asetpts=PTS-STARTPTS,atrim=duration={length:.3},aresample=48000,volume={}",
         gain(volume)
     );
     if fade_in > 0.0 {
@@ -1473,16 +1876,22 @@ pub fn music_graph(
         track.push_str(&format!(",afade=t=out:st={at:.3}:d={fade_out:.3}"));
     }
     let voice_src = if source_audio {
+        let level = gain(source_volume);
         match voice {
-            Some(filter) => format!("[0:a]{filter},volume=1[voice]"),
-            None => "[0:a]volume=1[voice]".to_string(),
+            Some(filter) => format!("[0:a]{filter},volume={level}[voice]"),
+            None => format!("[0:a]volume={level}[voice]"),
         }
     } else {
         format!("anullsrc=r=48000:cl=stereo,atrim=duration={length:.3}[voice]")
     };
-    format!(
-        "{voice_src};[{music_input}:a]{track}[music];[voice][music]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,loudnorm=I=-16:TP=-1.5:LRA=11[aout]"
-    )
+    let level = loudnorm(loudness.unwrap_or(-16));
+    let amix = "amix=inputs=2:duration=first:dropout_transition=0:normalize=0";
+    if duck && source_audio {
+        return format!(
+            "{voice_src};[{music_input}:a]{track}[music];[voice]asplit=2[speech][key];[music][key]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=400[ducked];[speech][ducked]{amix},{level}[aout]"
+        );
+    }
+    format!("{voice_src};[{music_input}:a]{track}[music];[voice][music]{amix},{level}[aout]")
 }
 
 fn audio_extension(path: &Path) -> Result<String> {
@@ -2002,13 +2411,6 @@ pub async fn forget_logo(app: AppHandle, path: String) -> Result<()> {
     Ok(())
 }
 
-fn output_frame(shape: &str, width: u64, height: u64) -> Result<(u32, u32)> {
-    if shape == "source" {
-        return Ok((width.max(2) as u32, height.max(2) as u32));
-    }
-    frame_size(shape, width, height)
-}
-
 fn decode_plate(png: &str) -> Result<Vec<u8>> {
     let bytes = STANDARD
         .decode(png.trim())
@@ -2022,43 +2424,249 @@ fn decode_plate(png: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportRequest {
+    pub title: String,
+    pub start: f64,
+    pub end: f64,
+    pub shape: String,
+    pub fit: String,
+    #[serde(default)]
+    pub crop: CropPosition,
+    pub headline: String,
+    pub voice: bool,
+    pub music: String,
+    pub music_mix: Option<MusicMix>,
+    pub pauses: bool,
+    pub logo: String,
+    pub corner: String,
+    pub speed: f64,
+    #[serde(default)]
+    pub captions: String,
+    /// −16, −14, or −11. Absent keeps a voice-only export as it was, and a music mix at −16.
+    #[serde(default)]
+    pub loudness: Option<i32>,
+    /// Calm-camera points. Empty keeps the static crop.
+    #[serde(default)]
+    pub camera: Vec<CropKey>,
+    /// Ranges to cut (filler words), seconds from the in point on the source clock.
+    #[serde(default)]
+    pub drops: Vec<(f64, f64)>,
+    /// Punch-in zooms, seconds from the in point on the source clock.
+    #[serde(default)]
+    pub zooms: Vec<(f64, f64)>,
+    /// The project video to cut from, when a batch mixes them. Absent is the batch's own id.
+    #[serde(default)]
+    pub video: Option<String>,
+    /// Other footage shown over parts of the clip.
+    #[serde(default)]
+    pub broll: Vec<BRollRequest>,
+    /// Text on the video (texts.rs).
+    #[serde(default)]
+    pub texts: Vec<crate::texts::TextRequest>,
+}
+
+/// B-roll (ClipCheap's b-roll layer): `length` seconds of a project video from `from`, shown `at` seconds after the
+/// clip's in point (source clock), over the whole frame (`cutaway`) or in a corner (`pip`). Its sound stays off.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BRollRequest {
+    pub video: String,
+    pub from: f64,
+    pub at: f64,
+    pub length: f64,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub corner: String,
+}
+
+/// The most b-roll shots on one clip.
+pub const MAX_BROLL: usize = 6;
+
+/// A b-roll shot ready to draw: its file, where it starts in that file, and when and how long it shows on the
+/// exported clock.
+pub struct BRollPart {
+    pub path: PathBuf,
+    pub from: f64,
+    pub start: f64,
+    pub length: f64,
+    /// Picture in picture: the shot's own shape, 40% of the frame's width.
+    pub pip: Option<(u32, u32)>,
+    pub corner: String,
+}
+
+/// Where a picture-in-picture box sits: a corner, 4% of the frame's short side in from its edges.
+fn pip_place(frame_w: u32, frame_h: u32, size: (u32, u32), corner: &str) -> (u32, u32) {
+    let margin = even(f64::from(frame_w.min(frame_h)) * 0.04);
+    let right = frame_w.saturating_sub(size.0 + margin);
+    let bottom = frame_h.saturating_sub(size.1 + margin);
+    match corner {
+        "top-left" => (margin, margin),
+        "bottom-left" => (margin, bottom),
+        "bottom-right" => (right, bottom),
+        _ => (right, margin),
+    }
+}
+
+/// The b-roll drawn over `[bpre]`, the clip's picture so far, from inputs `first_input`..: each shot fitted to the frame
+/// (or its corner box), moved to start when it shows, and overlaid only then. The chain ends unlabelled, so whatever
+/// follows (captions, the headline plate, the logo) draws over the b-roll too.
+pub fn broll_chain(
+    parts: &[BRollPart],
+    first_input: usize,
+    frame_w: u32,
+    frame_h: u32,
+    rate: f64,
+) -> String {
+    let rate = format_rate(rate);
+    let mut lines = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        let input = first_input + i;
+        let (start, length) = (part.start, part.length);
+        let fit = match part.pip {
+            Some((w, h)) => format!("scale={w}:{h}:flags=lanczos"),
+            None => format!(
+                "scale={frame_w}:{frame_h}:force_original_aspect_ratio=increase:flags=lanczos,crop={frame_w}:{frame_h}"
+            ),
+        };
+        lines.push(format!(
+            "[{input}:v]{fit},setsar=1,fps={rate},format=yuv420p,trim=duration={length:.3},setpts=PTS-STARTPTS+{start:.3}/TB[br{i}]"
+        ));
+    }
+    let mut chain = String::from("[bpre]");
+    for (i, part) in parts.iter().enumerate() {
+        let (x, y) = part
+            .pip
+            .map(|size| pip_place(frame_w, frame_h, size, &part.corner))
+            .unwrap_or((0, 0));
+        let end = part.start + part.length;
+        let output = if i + 1 < parts.len() {
+            format!("[bo{i}];[bo{i}]")
+        } else {
+            String::new()
+        };
+        chain.push_str(&format!(
+            "[br{i}]overlay=x={x}:y={y}:eof_action=pass:enable='between(t,{:.3},{end:.3})'{output}",
+            part.start
+        ));
+    }
+    format!("[bpre];{};{chain}", lines.join(";"))
+}
+
+#[derive(Clone)]
+pub(crate) struct ExportSource {
+    path: PathBuf,
+    duration: f64,
+    width: u64,
+    height: u64,
+    fps: f64,
+    audio: bool,
+}
+
+async fn export_source(app: &AppHandle, id: &str) -> Result<ExportSource> {
+    let path = source(app, id)?;
+    let (duration, width, height, fps, audio) = probe(&path).await?;
+    Ok(ExportSource {
+        path,
+        duration,
+        width,
+        height,
+        fps,
+        audio,
+    })
+}
+
+pub(crate) struct PreparedExport {
+    request: ExportRequest,
+    filter: String,
+    frame: (u32, u32),
+    plate: Option<Vec<u8>>,
+    captions: Option<crate::captions::Captions>,
+    loudness: Option<i32>,
+    motion: bool,
+}
+
+impl PreparedExport {
+    pub(crate) fn title(&self) -> &str {
+        &self.request.title
+    }
+
+    fn new(request: ExportRequest, input: &ExportSource) -> Result<Self> {
+        if !valid_range(request.start, request.end, input.duration) {
+            return Err("The cut must be inside the source and at least 0.25 seconds long.".into());
+        }
+        let loudness = loudness_level(request.loudness)?;
+        let follow = request.shape != "source"
+            && (request.fit.is_empty() || request.fit == "fill" || request.fit == "split")
+            && request.camera.len() >= 2;
+        let filter = if follow {
+            moving_crop(
+                &request.shape,
+                &request.fit,
+                input.width,
+                input.height,
+                &request.camera,
+            )?
+        } else {
+            clip_filter(
+                &request.shape,
+                &request.fit,
+                input.width,
+                input.height,
+                request.crop,
+            )?
+        };
+        let frame = frame_size(&request.shape, input.width, input.height)?;
+        if !request.logo.trim().is_empty() {
+            logo_place(frame.0, frame.1, request.corner.trim())?;
+        }
+        let plate = if request.headline.is_empty() {
+            None
+        } else {
+            Some(decode_plate(&request.headline)?)
+        };
+        let captions = crate::captions::parse(&request.captions)?;
+        if request.texts.len() > crate::texts::MAX_TEXTS {
+            return Err("A clip can have up to 8 text layers.".into());
+        }
+        for item in &request.texts {
+            crate::texts::check(item)?;
+        }
+        // A followed camera (always a shaped frame) moves the crop with `t`.
+        let motion = follow;
+        Ok(Self {
+            request,
+            filter,
+            frame,
+            plate,
+            captions,
+            loudness,
+            motion,
+        })
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportedClip {
+    title: String,
+    shape: String,
+    path: String,
+    duration: f64,
+    warning: Option<String>,
+}
+
 pub async fn export_clip(
     app: AppHandle,
     id: String,
-    title: String,
-    start: f64,
-    end: f64,
-    shape: String,
-    fit: String,
-    headline: String,
-    voice: bool,
-    music: String,
-    volume: f64,
-    pauses: bool,
-    logo: String,
-    corner: String,
-    speed: f64,
-    captions: String,
+    request: ExportRequest,
 ) -> Result<Option<String>> {
-    // Checked before the save dialog, so a bad request never leaves the user choosing a file for nothing.
-    let captions = crate::captions::parse(&captions)?;
-    let input = source(&app, &id)?;
-    let (duration, width, height, fps, source_audio) = probe(&input).await?;
-    if !valid_range(start, end, duration) {
-        return Err("The cut must be inside the source and at least 0.25 seconds long.".into());
-    }
-    let filter = clip_filter(&shape, &fit, width, height)?;
-    let plate = if headline.is_empty() {
-        None
-    } else {
-        Some(decode_plate(&headline)?)
-    };
-    let (frame_w, frame_h) = output_frame(&shape, width, height)?;
-    let corner = corner.trim();
-    if !logo.trim().is_empty() {
-        logo_place(frame_w, frame_h, corner)?;
-    }
-    let stem = file_stem(&title);
+    // Validate the render before asking the user to choose a file.
+    let input = export_source(&app, &id).await?;
+    let prepared = PreparedExport::new(request, &input)?;
+    let stem = file_stem(&prepared.request.title);
     let dialog = app
         .dialog()
         .file()
@@ -2077,35 +2685,121 @@ pub async fn export_clip(
     {
         return Err("Choose a filename ending in .mp4.".into());
     }
-    if target.starts_with(root(&app)?) || target == input {
+    if target.starts_with(root(&app)?) || target == input.path {
         return Err("Choose a destination outside your source library.".into());
     }
+    let rendered = render_prepared(&app, &input, &target, &prepared).await?;
+    if let Some(warning) = rendered.warning {
+        return Err(warning);
+    }
+    Ok(Some(rendered.path))
+}
+
+/// The clip's b-roll on the exported clock, each shot checked against its own video.
+async fn broll_parts(
+    app: &AppHandle,
+    request: &ExportRequest,
+    kept: Option<&[(f64, f64)]>,
+    frame_w: u32,
+) -> Result<Vec<BRollPart>> {
+    if request.broll.len() > MAX_BROLL {
+        return Err("A clip can have up to 6 b-roll shots.".into());
+    }
+    let span = request.end - request.start;
+    let mut parts = Vec::new();
+    for item in &request.broll {
+        if ![item.from, item.at, item.length]
+            .iter()
+            .all(|n| n.is_finite())
+            || item.length < 0.2
+            || item.from < 0.0
+        {
+            return Err("A b-roll shot needs a start and a length of at least 0.2 seconds.".into());
+        }
+        let path = source(app, &item.video)?;
+        let (duration, width, height, _, _) = probe(&path).await?;
+        if width == 0 || height == 0 {
+            return Err("A b-roll shot's video has no picture.".into());
+        }
+        let shown = played_spans(
+            &[(item.at, item.at + item.length)],
+            kept,
+            span,
+            request.speed,
+        );
+        let Some(&(first, _)) = shown.first() else {
+            continue;
+        };
+        let length: f64 = shown.iter().map(|(a, b)| b - a).sum();
+        let from = item.from.min((duration - length).max(0.0));
+        let pip = (item.mode == "pip").then(|| {
+            let w = even(f64::from(frame_w) * 0.4);
+            (w, even(f64::from(w) * height as f64 / width as f64))
+        });
+        parts.push(BRollPart {
+            path,
+            from,
+            start: first,
+            length: length.min(duration - from).max(0.1),
+            pip,
+            corner: item.corner.clone(),
+        });
+    }
+    Ok(parts)
+}
+
+async fn render_prepared(
+    app: &AppHandle,
+    input: &ExportSource,
+    target: &Path,
+    prepared: &PreparedExport,
+) -> Result<ExportedClip> {
+    let request = &prepared.request;
+    let start = request.start;
+    let end = request.end;
+    let voice = request.voice;
+    let pauses = request.pauses;
+    let speed = request.speed;
+    let music = request.music.as_str();
+    let logo = request.logo.as_str();
+    let corner = request.corner.trim();
+    let (frame_w, frame_h) = prepared.frame;
     let music_file = if music.trim().is_empty() {
         None
     } else {
-        Some(owned_music(&app, Path::new(music.trim())).await?)
+        Some(owned_music(app, Path::new(music.trim())).await?)
     };
+    let mut mix = request.music_mix.unwrap_or_default().bounded();
+    if let Some(file) = &music_file {
+        if mix.start > 0.0 {
+            let seconds = probe_audio(file).await?;
+            mix.start = mix.start.min(seconds - 0.05_f64.min(seconds / 2.0));
+        }
+    }
     let logo_file = if logo.trim().is_empty() {
         None
     } else {
-        Some(owned_logo(&app, Path::new(logo.trim())).await?)
+        Some(owned_logo(app, Path::new(logo.trim())).await?)
     };
-    let plate_path = if let Some(bytes) = plate {
+    let plate_path = if let Some(bytes) = &prepared.plate {
         let mut file = tempfile::Builder::new()
             .suffix(".png")
             .tempfile_in(target.parent().ok_or("Invalid destination.")?)
             .map_err(|e| e.to_string())?;
-        file.write_all(&bytes).map_err(|e| e.to_string())?;
+        file.write_all(bytes).map_err(|e| e.to_string())?;
         Some(file.into_temp_path())
     } else {
         None
     };
-    let keeps = if pauses && source_audio {
-        detect_keeps(&input, start, end - start).await?
+    let silent = if pauses && input.audio {
+        detect_keeps(&input.path, start, end - start).await?
     } else {
         None
     };
-    let scripts = captions.as_ref().map(|captions| {
+    let keeps = without_drops(silent, &request.drops, end - start);
+    let zooms = played_spans(&request.zooms, keeps.as_deref(), end - start, speed);
+    let broll = broll_parts(app, request, keeps.as_deref(), frame_w).await?;
+    let scripts = prepared.captions.as_ref().map(|captions| {
         caption_script(
             captions,
             end - start,
@@ -2115,52 +2809,234 @@ pub async fn export_clip(
             frame_h,
         )
     });
-    let caption_folder = match &scripts {
-        Some((ass, _)) => Some(
-            caption_folder(
+    let texts = text_script(request, keeps.as_deref(), frame_w, frame_h)?;
+    let caption_folder = if scripts.is_some() || texts.is_some() {
+        Some(
+            script_folder(
                 &app.path()
                     .resource_dir()
                     .map_err(|e| e.to_string())?
                     .join("fonts"),
-                ass,
+                scripts.as_ref().map(|(ass, _)| ass.as_str()),
+                texts.as_deref(),
             )
             .await?,
-        ),
-        None => None,
+        )
+    } else {
+        None
     };
     render_captioned(
-        &input,
-        &target,
+        &input.path,
+        target,
         start,
         end,
-        &filter,
+        &prepared.filter,
         voice,
         plate_path.as_deref(),
         frame_w,
         frame_h,
         music_file.as_deref(),
-        volume,
-        source_audio,
+        mix,
+        input.audio,
         keeps.as_deref(),
-        fps,
+        input.fps,
         logo_file.as_deref(),
         corner,
         speed,
         caption_folder.as_ref().map(|dir| dir.path()),
+        prepared.loudness,
+        prepared.motion,
+        &zooms,
+        &broll,
     )
     .await?;
-    // The captions as SubRip beside the clip, timed as burned in, for platforms that take a captions file
-    // (clip-ai uploads one with every render).
-    if let Some((_, srt)) = &scripts {
-        fs::write(target.with_extension("srt"), srt)
-            .await
-            .map_err(|e| format!("The clip was saved, but its captions file was not: {e}"))?;
+    // Finalize the sidecar and return the saved path without another await: cancellation should
+    // never hide an MP4 already published by render_captioned.
+    let warning = scripts.and_then(|(_, srt)| {
+        std::fs::write(target.with_extension("srt"), srt)
+            .err()
+            .map(|e| format!("The clip was saved, but its captions file was not: {e}"))
+    });
+    let spoken = keeps.map_or(end - start, |spans| spans.iter().map(|(a, b)| b - a).sum());
+    Ok(ExportedClip {
+        title: request.title.clone(),
+        shape: request.shape.clone(),
+        path: target.to_string_lossy().into_owned(),
+        duration: spoken / clip_speed(speed),
+        warning,
+    })
+}
+
+/// Every request checked against its own video (each probed once), before anything is rendered.
+pub(crate) async fn prepare_all(
+    app: &AppHandle,
+    id: &str,
+    requests: Vec<ExportRequest>,
+) -> Result<Vec<(ExportSource, PreparedExport)>> {
+    let mut inputs: std::collections::HashMap<String, ExportSource> =
+        std::collections::HashMap::new();
+    let mut items = Vec::with_capacity(requests.len());
+    for request in requests {
+        let key = request.video.clone().unwrap_or_else(|| id.to_string());
+        if !inputs.contains_key(&key) {
+            let input = export_source(app, &key).await?;
+            inputs.insert(key.clone(), input);
+        }
+        let input = inputs[&key].clone();
+        let prepared = PreparedExport::new(request, &input)?;
+        items.push((input, prepared));
     }
-    Ok(Some(target.to_string_lossy().into_owned()))
+    Ok(items)
+}
+
+/// One clip rendered with all its settings, as a part of something larger.
+pub(crate) async fn render_part(
+    app: &AppHandle,
+    input: &ExportSource,
+    target: &Path,
+    item: &PreparedExport,
+) -> Result<()> {
+    render_prepared(app, input, target, item).await.map(|_| ())
+}
+
+const MAX_BATCH_EXPORTS: usize = 16;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FailedExport {
+    title: String,
+    shape: String,
+    error: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchReport {
+    folder: Option<String>,
+    total: usize,
+    outputs: Vec<ExportedClip>,
+    failures: Vec<FailedExport>,
+    cancelled: bool,
+}
+
+fn batch_name(index: usize, title: &str, shape: &str) -> String {
+    let ratio = match shape {
+        "landscape" => "16x9",
+        "vertical" => "9x16",
+        "square" => "1x1",
+        "portrait" => "4x5",
+        _ => "original",
+    };
+    format!("{:02}-{}-{ratio}.mp4", index + 1, file_stem(title))
+}
+
+fn batch_folder(parent: &Path) -> Result<PathBuf> {
+    tempfile::Builder::new()
+        .prefix("Quikclip-")
+        .tempdir_in(parent)
+        .map(|temp| temp.keep())
+        .map_err(|e| format!("Could not create the export folder: {e}"))
+}
+
+pub async fn export_batch(
+    app: AppHandle,
+    id: String,
+    requests: Vec<ExportRequest>,
+    mut cancel: watch::Receiver<bool>,
+) -> Result<Option<BatchReport>> {
+    let total = requests.len();
+    if !(1..=MAX_BATCH_EXPORTS).contains(&total) {
+        return Err("Choose between 1 and 16 files for a batch.".into());
+    }
+    // Each request cuts from its own video; each video is probed once.
+    let mut inputs: std::collections::HashMap<String, ExportSource> =
+        std::collections::HashMap::new();
+    let mut items = Vec::with_capacity(total);
+    for request in requests {
+        let key = request.video.clone().unwrap_or_else(|| id.clone());
+        if !inputs.contains_key(&key) {
+            let input = export_source(&app, &key).await?;
+            inputs.insert(key.clone(), input);
+        }
+        let prepared = PreparedExport::new(request, &inputs[&key])?;
+        items.push((key, prepared));
+    }
+    if *cancel.borrow() {
+        return Ok(None);
+    }
+    let dialog = app
+        .dialog()
+        .file()
+        .set_title("Choose a folder for the export batch");
+    let picked = tauri::async_runtime::spawn_blocking(move || dialog.blocking_pick_folder())
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
+    if *cancel.borrow() {
+        return Ok(None);
+    }
+    let parent = picked.into_path().map_err(|e| e.to_string())?;
+    let canonical = fs::canonicalize(&parent).await.map_err(|e| e.to_string())?;
+    let library = root(&app)?;
+    let canonical_library = fs::canonicalize(&library).await.unwrap_or(library);
+    if canonical.starts_with(canonical_library) {
+        return Err("Choose a destination outside your source library.".into());
+    }
+    let folder = batch_folder(&parent)?;
+    let mut report = BatchReport {
+        folder: None,
+        total,
+        outputs: Vec::new(),
+        failures: Vec::new(),
+        cancelled: false,
+    };
+    let mut progress = Tracker::new(vec!["Batch export"], |step| {
+        let _ = app.emit("studio-step", step);
+    });
+    for (index, (key, item)) in items.iter().enumerate() {
+        let input = &inputs[key];
+        if *cancel.borrow() {
+            report.cancelled = true;
+            break;
+        }
+        let ExportRequest { title, shape, .. } = &item.request;
+        progress.show(
+            "Batch export",
+            format!("Rendering {} of {total}", index + 1),
+            Some(index as f64 / total as f64),
+            Some(title.clone()),
+        );
+        let target = folder.join(batch_name(index, title, shape));
+        let rendered = tokio::select! {
+            biased;
+            _ = cancel.changed() => {
+                report.cancelled = true;
+                break;
+            }
+            result = render_prepared(&app, input, &target, item) => result,
+        };
+        match rendered {
+            Ok(output) => report.outputs.push(output),
+            Err(error) => report.failures.push(FailedExport {
+                title: title.clone(),
+                shape: shape.clone(),
+                error,
+            }),
+        }
+    }
+    if report.outputs.is_empty() {
+        // Only remove the directory we just created, and only if it is still empty.
+        let _ = fs::remove_dir(&folder).await;
+    } else {
+        report.folder = Some(folder.to_string_lossy().into_owned());
+    }
+    Ok(Some(report))
 }
 
 /// A safe file name from a title: letters, digits and dashes, the rest as underscores.
-fn file_stem(title: &str) -> String {
+pub(crate) fn file_stem(title: &str) -> String {
     let stem: String = title
         .chars()
         .map(|c| {
@@ -2245,6 +3121,59 @@ fn caption_script(
     )
 }
 
+/// The clip's text layers as an ASS script on the exported clock, or None when it has none showing.
+fn text_script(
+    request: &ExportRequest,
+    kept: Option<&[(f64, f64)]>,
+    frame_w: u32,
+    frame_h: u32,
+) -> Result<Option<String>> {
+    let span = request.end - request.start;
+    let shown: Vec<crate::texts::Shown> = request
+        .texts
+        .iter()
+        .filter_map(|item| {
+            let spans = played_spans(
+                &[(item.at, item.at + item.length)],
+                kept,
+                span,
+                request.speed,
+            );
+            let (first, last) = (spans.first()?, spans.last()?);
+            Some(crate::texts::Shown {
+                request: item.clone(),
+                start: first.0,
+                end: last.1,
+            })
+        })
+        .collect();
+    if shown.is_empty() {
+        return Ok(None);
+    }
+    crate::texts::texts_ass(&shown, frame_w, frame_h).map(Some)
+}
+
+/// A folder holding the caption font and `captions.ass` and/or `texts.ass`: ffmpeg runs in it, so the `ass` filters
+/// name them relatively.
+async fn script_folder(
+    fonts: &Path,
+    captions: Option<&str>,
+    texts: Option<&str>,
+) -> Result<tempfile::TempDir> {
+    let dir = caption_folder(fonts, captions.unwrap_or("")).await?;
+    if captions.is_none() {
+        fs::remove_file(dir.path().join("captions.ass"))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(script) = texts {
+        fs::write(dir.path().join("texts.ass"), script)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(dir)
+}
+
 /// A folder holding `captions.ass` and the caption font: ffmpeg runs in it, so the `ass` filter names both relatively.
 async fn caption_folder(fonts: &Path, script: &str) -> Result<tempfile::TempDir> {
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
@@ -2294,7 +3223,7 @@ async fn render(
         frame_w,
         frame_h,
         music,
-        volume,
+        MusicMix::with_volume(volume),
         source_audio,
         kept,
         rate,
@@ -2302,6 +3231,10 @@ async fn render(
         corner,
         speed,
         None,
+        None,
+        false,
+        &[],
+        &[],
     )
     .await
 }
@@ -2320,7 +3253,7 @@ async fn render_captioned(
     frame_w: u32,
     frame_h: u32,
     music: Option<&Path>,
-    volume: f64,
+    mix: MusicMix,
     source_audio: bool,
     kept: Option<&[(f64, f64)]>,
     rate: f64,
@@ -2328,6 +3261,10 @@ async fn render_captioned(
     corner: &str,
     speed: f64,
     captions: Option<&Path>,
+    loudness: Option<i32>,
+    motion: bool,
+    zooms: &[(f64, f64)],
+    broll: &[BRollPart],
 ) -> Result<()> {
     let temp = tempfile::Builder::new()
         .suffix(".mp4")
@@ -2355,17 +3292,40 @@ async fn render_captioned(
     let plate_arg = plate.map(text).transpose()?;
     let logo_arg = logo.map(text).transpose()?;
     let music_arg = music.map(text).transpose()?;
-    let mut picture_filter = pace_video(
-        &match kept {
-            Some(spans) => format!("{},{filter}", video_select(spans, rate)),
-            None => filter.to_string(),
-        },
-        speed,
-    );
-    if captions.is_some() {
-        picture_filter.push_str(",ass=captions.ass:fontsdir=fonts");
+    // A moving crop reads `t` on the source clock. Pause removal resets `t`, so the crop goes first.
+    let paced_base = match (kept, motion) {
+        (Some(spans), true) => format!("{filter},{}", video_select(spans, rate)),
+        (Some(spans), false) => format!("{},{filter}", video_select(spans, rate)),
+        (None, _) => filter.to_string(),
+    };
+    let mut picture_filter = pace_video(&paced_base, speed);
+    if let Some(punch) = punch_filter(frame_w, frame_h, zooms) {
+        picture_filter.push(',');
+        picture_filter.push_str(&punch);
     }
-    let sound = sound_chain(voice, kept, speed);
+    // B-roll inputs follow the plate, the logo, and the music.
+    let broll_input = 1
+        + usize::from(plate.is_some())
+        + usize::from(logo.is_some())
+        + usize::from(music.is_some());
+    if !broll.is_empty() {
+        picture_filter.push_str(&broll_chain(broll, broll_input, frame_w, frame_h, rate));
+    }
+    // The folder holds captions, text layers, or both; text layers draw over the captions.
+    if let Some(folder) = captions {
+        if folder.join("captions.ass").is_file() {
+            picture_filter.push_str(",ass=captions.ass:fontsdir=fonts");
+        }
+        if folder.join("texts.ass").is_file() {
+            picture_filter.push_str(",ass=texts.ass:fontsdir=fonts");
+        }
+    }
+    let chain = sound_chain(voice, kept, speed);
+    let sound = if music.is_some() {
+        chain.clone()
+    } else {
+        with_loudness(chain.clone(), loudness)
+    };
     let logo_on = logo.is_some();
     // No logo keeps the previous picture graph, including the plain `-vf` path.
     let picture = if logo_on {
@@ -2385,7 +3345,14 @@ async fn render_captioned(
     };
     let music_input = 1 + usize::from(plate.is_some()) + usize::from(logo_on);
     let mixed = music.is_some().then(|| {
-        let audio = music_graph(sound.as_deref(), volume, paced, music_input, source_audio);
+        let audio = music_graph(
+            chain.as_deref(),
+            mix,
+            paced,
+            music_input,
+            source_audio,
+            loudness,
+        );
         format!("{picture};{audio}")
     });
     let mut args = vec!["-v", "error", "-nostdin", "-y", "-ss", &start];
@@ -2403,19 +3370,28 @@ async fn render_captioned(
         args.extend(["-loop", "1", "-i", path]);
     }
     if let Some(path) = music_arg {
-        args.extend([
-            "-stream_loop",
-            "-1",
-            "-protocol_whitelist",
-            "file",
-            "-i",
-            path,
-        ]);
+        if mix.repeat {
+            args.extend(["-stream_loop", "-1"]);
+        }
+        args.extend(["-protocol_whitelist", "file", "-i", path]);
+    }
+    let shots: Vec<(String, String, &str)> = broll
+        .iter()
+        .map(|part| {
+            Ok((
+                format!("{:.3}", part.from),
+                format!("{:.3}", part.length + 0.1),
+                text(&part.path)?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    for (from, length, path) in &shots {
+        args.extend(["-ss", from.as_str(), "-t", length.as_str(), "-i", path]);
     }
     args.extend(["-t", &written]);
     if let Some(graph) = mixed.as_deref() {
         args.extend(["-filter_complex", graph, "-map", "[v]", "-map", "[aout]"]);
-    } else if plate.is_some() || logo_on {
+    } else if plate.is_some() || logo_on || !broll.is_empty() {
         args.extend(["-filter_complex", &picture, "-map", "[v]"]);
         args.extend(["-map", "0:a:0?"]);
         if let Some(audio) = sound.as_deref() {
@@ -2451,29 +3427,36 @@ async fn render_captioned(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn batches_never_reuse_a_directory_or_another_items_filename() {
+        let root = tempfile::tempdir().unwrap();
+        let one = batch_folder(root.path()).unwrap();
+        let two = batch_folder(root.path()).unwrap();
+        assert!(one.is_dir() && two.is_dir());
+        assert_ne!(one, two);
+        assert_eq!(
+            batch_name(0, "Clip / one", "vertical"),
+            "01-Clip___one-9x16.mp4"
+        );
+        assert_ne!(
+            batch_name(0, "Same title", "square"),
+            batch_name(1, "Same title", "square")
+        );
+        let name = batch_name(0, "../../CON", "source");
+        assert_eq!(Path::new(&name).file_name().unwrap(), name.as_str());
+        assert!(name.ends_with("-original.mp4"));
+    }
+
     #[tokio::test]
     async fn exports_a_playable_cropped_range_with_audio() {
         let sample = Path::new(env!("CARGO_MANIFEST_DIR")).join("../public/sample/alpine.mp4");
         let tmp = tempfile::tempdir().unwrap();
         let output = tmp.path().join("cut.mp4");
+        let center = CropPosition::default();
+        let fill = clip_filter("vertical", "fill", 1280, 640, center).unwrap();
         render(
-            &sample,
-            &output,
-            2.,
-            3.5,
-            "crop=360:640,setsar=1",
-            false,
-            None,
-            360,
-            640,
-            None,
-            0.2,
-            true,
-            None,
-            24.,
-            None,
-            "",
-            1.0,
+            &sample, &output, 2., 3.5, &fill, false, None, 360, 640, None, 0.2, true, None, 24.,
+            None, "", 1.0,
         )
         .await
         .unwrap();
@@ -2482,7 +3465,7 @@ mod tests {
         assert_eq!((w, h, audio), (360, 640, true));
         let (source_duration, width, height, _, _) = probe(&sample).await.unwrap();
         assert!(source_duration > 3.5);
-        let blur = clip_filter("vertical", "blur", width, height).unwrap();
+        let blur = clip_filter("vertical", "blur", width, height, center).unwrap();
         assert!(blur.contains("boxblur=10:2"));
         assert!(blur.contains("eq=brightness=-0.18"));
         let blurred = tmp.path().join("blur.mp4");
@@ -2514,23 +3497,165 @@ mod tests {
         assert_eq!(wave_into(folder, "portrait").await.unwrap(), Some(wave));
     }
     #[test]
-    fn fill_stays_a_center_crop_and_blur_uses_the_same_frame() {
-        let fill = clip_filter("vertical", "fill", 1280, 640).unwrap();
-        assert_eq!(
-            fill,
-            "crop=w='trunc(min(iw,ih*9/16)/2)*2':h='trunc(min(ih,iw*16/9)/2)*2',setsar=1"
-        );
+    fn crop_keeps_the_center_default_and_uses_even_offsets() {
+        let center = CropPosition::default();
+        let fill = clip_filter("vertical", "fill", 1280, 640, center).unwrap();
+        assert_eq!(fill, "crop=360:640:460:0,setsar=1");
         assert_eq!(frame_size("vertical", 1280, 640).unwrap(), (360, 640));
         assert_eq!(frame_size("square", 1280, 640).unwrap(), (640, 640));
+        assert_eq!(frame_size("landscape", 180, 320).unwrap(), (180, 100));
+        assert_eq!(frame_size("portrait", 1280, 640).unwrap(), (512, 640));
         assert_eq!(
-            clip_filter("source", "blur", 1280, 640).unwrap(),
+            clip_filter("portrait", "fill", 1280, 640, CropPosition { x: 75, y: 0 }).unwrap(),
+            "crop=512:640:576:0,setsar=1"
+        );
+        assert_eq!(
+            clip_filter("source", "blur", 1280, 640, center).unwrap(),
             "setsar=1"
         );
-        assert!(clip_filter("vertical", "pan", 1280, 640).is_err());
+        assert!(clip_filter("vertical", "pan", 1280, 640, center).is_err());
+        assert!(clip_filter(
+            "vertical",
+            "fill",
+            1280,
+            640,
+            CropPosition { x: 101, y: 50 }
+        )
+        .is_err());
+        assert_eq!(
+            clip_filter("portrait", "blur", 1280, 640, center).unwrap(),
+            clip_filter("portrait", "blur", 1280, 640, CropPosition { x: 0, y: 0 }).unwrap(),
+        );
         assert_eq!(voice_filter(false), None);
         assert_eq!(voice_filter(true), Some("highpass=f=90"));
         assert!(with_plate("setsar=1", 360, 640, false).contains("scale=360:640"));
         assert!(decode_plate("not-a-png").is_err());
+    }
+    #[test]
+    fn loudness_and_a_moving_crop_keep_the_old_static_export() {
+        assert_eq!(loudness_level(None).unwrap(), None);
+        assert_eq!(loudness_level(Some(-14)).unwrap(), Some(-14));
+        assert!(loudness_level(Some(-15)).is_err());
+        assert_eq!(with_loudness(None, None), None);
+        assert_eq!(
+            with_loudness(Some("highpass=f=90".into()), Some(-14)).as_deref(),
+            Some("highpass=f=90,loudnorm=I=-14:TP=-1.5:LRA=11")
+        );
+        assert_eq!(
+            with_loudness(None, Some(-11)).as_deref(),
+            Some("loudnorm=I=-11:TP=-1.5:LRA=11")
+        );
+        let louder = music_graph(None, MusicMix::default(), 1.2, 1, true, Some(-14));
+        assert!(louder.contains("loudnorm=I=-14:TP=-1.5:LRA=11"));
+        assert!(!louder.contains("I=-16"));
+        let keys = [
+            CropKey {
+                t: 0.0,
+                x: 0.0,
+                y: 50.0,
+            },
+            CropKey {
+                t: 1.0,
+                x: 100.0,
+                y: 50.0,
+            },
+        ];
+        assert_eq!(
+            moving_crop("vertical", "fill", 1280, 640, &keys).unwrap(),
+            "crop=360:640:x='trunc((920*if(lt(t,1.0000),0.0000+100.000000*(t-0.0000),100.0000))/200)*2':y='0',setsar=1"
+        );
+        assert!(moving_crop("vertical", "fill", 1280, 640, &keys[..1]).is_err());
+    }
+    #[tokio::test]
+    async fn a_moving_crop_stays_playable() {
+        let sample = Path::new(env!("CARGO_MANIFEST_DIR")).join("../public/sample/alpine.mp4");
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("follow.mp4");
+        let filter = moving_crop(
+            "vertical",
+            "fill",
+            1280,
+            640,
+            &[
+                CropKey {
+                    t: 0.0,
+                    x: 0.0,
+                    y: 50.0,
+                },
+                CropKey {
+                    t: 0.4,
+                    x: 100.0,
+                    y: 50.0,
+                },
+            ],
+        )
+        .unwrap();
+        render(
+            &sample, &output, 1.0, 1.5, &filter, false, None, 360, 640, None, 0.2, true, None, 24.,
+            None, "", 1.0,
+        )
+        .await
+        .unwrap();
+        let (duration, w, h, _, audio) = probe(&output).await.unwrap();
+        assert!((duration - 0.5).abs() < 0.15);
+        assert_eq!((w, h, audio), (360, 640, true));
+    }
+    #[tokio::test]
+    async fn aligned_crop_exports_the_requested_part_of_the_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("bands.mp4");
+        run(
+            "ffmpeg",
+            &[
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=180x320:r=12:d=1,drawbox=y=160:w=iw:h=160:color=blue:t=fill",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                text(&source).unwrap(),
+            ],
+            30,
+        )
+        .await
+        .unwrap();
+        for (y, channel) in [(0, 0), (100, 2)] {
+            let output = tmp.path().join(format!("crop-{y}.mp4"));
+            let filter =
+                clip_filter("landscape", "fill", 180, 320, CropPosition { x: 50, y }).unwrap();
+            render(
+                &source, &output, 0., 0.5, &filter, false, None, 180, 100, None, 0., false, None,
+                12., None, "", 1.,
+            )
+            .await
+            .unwrap();
+            let (_, width, height, _, _) = probe(&output).await.unwrap();
+            assert_eq!((width, height), (180, 100));
+            let pixel = run(
+                "ffmpeg",
+                &[
+                    "-v",
+                    "error",
+                    "-i",
+                    text(&output).unwrap(),
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    "format=rgb24,crop=1:1:90:50",
+                    "-f",
+                    "rawvideo",
+                    "-",
+                ],
+                30,
+            )
+            .await
+            .unwrap();
+            assert!(pixel[channel] > 200 && pixel[2 - channel] < 30, "{pixel:?}");
+        }
     }
     #[tokio::test]
     async fn clearer_voice_and_a_headline_plate_stay_playable() {
@@ -2570,17 +3695,31 @@ mod tests {
     }
     #[test]
     fn music_mixes_under_the_clip_on_its_clock() {
-        let short = music_graph(None, 0.2, 1.2, 1, true);
+        let short = music_graph(None, MusicMix::default(), 1.2, 1, true, None);
         assert_eq!(
             short,
             "[0:a]volume=1[voice];[1:a]atrim=start=0.000,asetpts=PTS-STARTPTS,atrim=duration=1.200,aresample=48000,volume=0.2,afade=t=in:st=0:d=0.500,afade=t=out:st=0.600:d=0.600[music];[voice][music]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,loudnorm=I=-16:TP=-1.5:LRA=11[aout]"
         );
-        let voiced = music_graph(Some("highpass=f=90"), 0.2, 20.0, 2, true);
+        let voiced = music_graph(
+            Some("highpass=f=90"),
+            MusicMix::default(),
+            20.0,
+            2,
+            true,
+            None,
+        );
         assert_eq!(
             voiced,
             "[0:a]highpass=f=90,volume=1[voice];[2:a]atrim=start=0.000,asetpts=PTS-STARTPTS,atrim=duration=20.000,aresample=48000,volume=0.2,afade=t=in:st=0:d=0.500,afade=t=out:st=19.000:d=1.000[music];[voice][music]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,loudnorm=I=-16:TP=-1.5:LRA=11[aout]"
         );
-        let silent = music_graph(Some("highpass=f=90"), 0.2, 1.2, 1, false);
+        let silent = music_graph(
+            Some("highpass=f=90"),
+            MusicMix::default(),
+            1.2,
+            1,
+            false,
+            None,
+        );
         assert!(silent.starts_with("anullsrc=r=48000:cl=stereo,atrim=duration=1.200[voice]"));
         assert!(!silent.contains("highpass"));
         assert_eq!(track_name(Path::new("my_cool-track.mp3")), "my cool track");
@@ -2595,6 +3734,107 @@ mod tests {
         let wav = tmp.path().join("bed.wav");
         std::fs::write(&wav, b"RIFF").unwrap();
         assert!(accepted_music(&wav).is_ok());
+    }
+    #[test]
+    fn music_mix_uses_source_level_offset_and_custom_fades() {
+        let mix: MusicMix = serde_json::from_str(
+            r#"{"volume":0.35,"source_volume":0.25,"start":3.25,"fade_in":0,"fade_out":2,"loop":false}"#,
+        )
+        .unwrap();
+        assert!(!mix.repeat);
+        let graph = music_graph(Some("highpass=f=90"), mix, 10.0, 2, true, None);
+        assert!(graph.starts_with("[0:a]highpass=f=90,volume=0.25[voice]"));
+        assert!(graph.contains("[2:a]atrim=start=3.250"));
+        assert!(!graph.contains("afade=t=in"));
+        assert!(graph.contains("volume=0.35,afade=t=out:st=8.000:d=2.000"));
+    }
+    #[tokio::test]
+    async fn a_non_looping_mix_stops_at_the_track_end_and_keeps_the_source_muted() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../public/sample/alpine.mp4");
+        let tmp = tempfile::tempdir().unwrap();
+        let track = tmp.path().join("short-tone.wav");
+        run(
+            "ffmpeg",
+            &[
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=0.4",
+                text(&track).unwrap(),
+            ],
+            30,
+        )
+        .await
+        .unwrap();
+        let mixed = tmp.path().join("mixed.mp4");
+        let mix = MusicMix {
+            volume: 1.0,
+            source_volume: 0.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            start: 0.1,
+            repeat: false,
+            duck: false,
+        };
+        render_captioned(
+            &source,
+            &mixed,
+            2.0,
+            3.2,
+            "scale=320:160,setsar=1",
+            false,
+            None,
+            320,
+            160,
+            Some(&track),
+            mix,
+            true,
+            None,
+            24.0,
+            None,
+            "",
+            1.0,
+            None,
+            None,
+            false,
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        let audio = run(
+            "ffmpeg",
+            &[
+                "-v",
+                "error",
+                "-i",
+                text(&mixed).unwrap(),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "8000",
+                "-f",
+                "f32le",
+                "-",
+            ],
+            30,
+        )
+        .await
+        .unwrap();
+        let rms = |from: f64, to: f64| {
+            let part = &audio[(from * 32000.0) as usize..(to * 32000.0) as usize];
+            let energy: f32 = part
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()).powi(2))
+                .sum();
+            (energy / (part.len() / 4) as f32).sqrt()
+        };
+        assert!(rms(0.05, 0.2) > 0.04);
+        assert!(rms(0.34, 0.38) < 0.01);
+        assert!(rms(0.6, 0.9) < 0.01);
     }
     #[tokio::test]
     async fn music_under_a_headline_stays_playable() {
@@ -3009,7 +4249,7 @@ mod tests {
             640,
             360,
             None,
-            0.2,
+            MusicMix::default(),
             true,
             None,
             25.0,
@@ -3017,6 +4257,10 @@ mod tests {
             "",
             1.0,
             Some(folder.path()),
+            None,
+            false,
+            &[],
+            &[],
         )
         .await
         .unwrap();
@@ -3085,7 +4329,7 @@ mod tests {
     #[test]
     fn software_import_uses_the_fast_x264_preset() {
         assert_eq!(
-            import_transcode_args("in.mp4", "out.mp4", &SOFTWARE_ENCODER),
+            import_transcode_args("in.mp4", "out.mp4", &SOFTWARE_ENCODER, false),
             vec![
                 "-v",
                 "error",
@@ -3116,7 +4360,7 @@ mod tests {
             ]
         );
         for encoder in HARDWARE_ENCODERS {
-            let args = import_transcode_args("in.mp4", "out.mp4", encoder);
+            let args = import_transcode_args("in.mp4", "out.mp4", encoder, false);
             assert!(args
                 .windows(2)
                 .any(|pair| pair == ["-c:v", encoder.codec].as_slice()));
@@ -3444,7 +4688,7 @@ mod tests {
         assert_eq!(leading, vec![(0.88, 3.0)]);
         assert!(applied_keeps(&[(1.0, 1.5)], 4.0).is_none());
         assert!(applied_keeps(&[(0.0, 10.0)], 10.0).is_none());
-        let blur = clip_filter("vertical", "blur", 1280, 640).unwrap();
+        let blur = clip_filter("vertical", "blur", 1280, 640, CropPosition::default()).unwrap();
         let picture = format!("{},{blur}", video_select(&kept, 24.0));
         assert!(picture.starts_with("fps=24,select="));
         assert!(picture.contains("boxblur=10:2"));
@@ -3808,5 +5052,418 @@ mod tests {
         assert!(png_size(&tiny).is_err());
         assert!(png_size(b"not a png").is_err());
         assert_eq!(logo_name(Path::new("my_mark.png")), "my mark");
+    }
+}
+
+#[cfg(test)]
+mod polish_tests {
+    use super::*;
+
+    fn sample() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../public/sample/alpine.mp4")
+    }
+
+    #[test]
+    fn filler_drops_cut_into_the_kept_ranges() {
+        // No silence cut: the whole clip less each filler.
+        assert_eq!(
+            without_drops(None, &[(1.0, 1.4), (3.0, 3.2)], 5.0),
+            Some(vec![(0.0, 1.0), (1.4, 3.0), (3.2, 5.0)])
+        );
+        // With silence cut: drops only shorten what stays, and a drop over a gap changes nothing.
+        let kept = Some(vec![(0.0, 2.0), (3.0, 5.0)]);
+        assert_eq!(
+            without_drops(kept.clone(), &[(1.5, 3.5)], 5.0),
+            Some(vec![(0.0, 1.5), (3.5, 5.0)])
+        );
+        assert_eq!(without_drops(kept.clone(), &[(2.2, 2.8)], 5.0), kept);
+        // Nothing to cut, or everything: the clip stays as it was.
+        assert_eq!(without_drops(None, &[], 5.0), None);
+        assert_eq!(without_drops(None, &[(0.0, 4.9)], 5.0), None);
+        assert_eq!(without_drops(None, &[(f64::NAN, 1.0)], 5.0), None);
+    }
+
+    #[test]
+    fn punch_ins_move_onto_the_exported_clock() {
+        // Through the kept ranges: 0–2 and 3–5 play back to back.
+        let kept = [(0.0, 2.0), (3.0, 5.0)];
+        assert_eq!(
+            played_spans(&[(1.0, 4.0)], Some(&kept), 5.0, 1.0),
+            vec![(1.0, 3.0)]
+        );
+        // Then the speed.
+        assert_eq!(
+            played_spans(&[(1.0, 2.0)], None, 5.0, 1.25),
+            vec![(0.8, 1.6)]
+        );
+        assert!(played_spans(&[(2.2, 2.8)], Some(&kept), 5.0, 1.0).is_empty());
+        assert_eq!(punch_filter(360, 640, &[]), None);
+        let punch = punch_filter(360, 640, &[(0.5, 1.0), (2.0, 3.0)]).unwrap();
+        assert!(punch.contains("crop=300:532,scale=360:640"));
+        assert!(punch.ends_with("enable='between(t,0.500,1.000)+between(t,2.000,3.000)'"));
+    }
+
+    #[test]
+    fn split_layout_stacks_the_face_band_over_the_whole_picture() {
+        assert_eq!(split_band(640), 268);
+        let center = CropPosition::default();
+        let split = clip_filter("vertical", "split", 1280, 640, center).unwrap();
+        assert!(split.starts_with("split[facesrc][mainsrc];[facesrc]crop=360:268:460:186[face];"));
+        assert!(split.ends_with("[face][main]vstack,setsar=1"));
+        assert!(clip_filter("landscape", "split", 1280, 640, center).is_err());
+        let keys = [
+            CropKey {
+                t: 0.0,
+                x: 0.0,
+                y: 0.0,
+            },
+            CropKey {
+                t: 1.0,
+                x: 100.0,
+                y: 100.0,
+            },
+        ];
+        let moving = moving_crop("vertical", "split", 1280, 640, &keys).unwrap();
+        assert!(moving.contains("[facesrc]crop=360:268:x='"));
+        assert!(moving.ends_with("vstack,setsar=1"));
+    }
+
+    #[test]
+    fn ducked_music_dips_under_the_clip_sound() {
+        let mix = MusicMix {
+            duck: true,
+            ..MusicMix::default()
+        };
+        let graph = music_graph(None, mix, 4.0, 1, true, None);
+        assert!(graph.contains(
+            "[voice]asplit=2[speech][key];[music][key]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=400[ducked]"
+        ));
+        // A silent clip has nothing to duck under.
+        assert!(!music_graph(None, mix, 4.0, 1, false, None).contains("sidechaincompress"));
+        assert!(!music_graph(None, MusicMix::default(), 4.0, 1, true, None).contains("asplit"));
+    }
+
+    #[tokio::test]
+    async fn split_punch_ins_and_filler_cuts_render() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("polish.mp4");
+        let filter = clip_filter("vertical", "split", 1280, 640, CropPosition::default()).unwrap();
+        let kept = without_drops(None, &[(0.5, 0.8)], 2.0).unwrap();
+        let zooms = played_spans(&[(1.0, 1.6)], Some(&kept), 2.0, 1.0);
+        render_captioned(
+            &sample(),
+            &output,
+            2.0,
+            4.0,
+            &filter,
+            false,
+            None,
+            360,
+            640,
+            None,
+            MusicMix::default(),
+            true,
+            Some(&kept),
+            24.0,
+            None,
+            "",
+            1.0,
+            None,
+            None,
+            false,
+            &zooms,
+            &[],
+        )
+        .await
+        .unwrap();
+        let (duration, w, h, _, audio) = probe(&output).await.unwrap();
+        assert!((duration - 1.7).abs() < 0.12, "{duration}");
+        assert_eq!((w, h, audio), (360, 640, true));
+    }
+
+    #[tokio::test]
+    async fn ducked_music_renders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("ducked.mp4");
+        let music = tmp.path().join("tone.wav");
+        run(
+            "ffmpeg",
+            &[
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=3",
+                "-y",
+                text(&music).unwrap(),
+            ],
+            60,
+        )
+        .await
+        .unwrap();
+        let filter = clip_filter("vertical", "fill", 1280, 640, CropPosition::default()).unwrap();
+        render_captioned(
+            &sample(),
+            &output,
+            1.0,
+            2.5,
+            &filter,
+            false,
+            None,
+            360,
+            640,
+            Some(&music),
+            MusicMix {
+                duck: true,
+                ..MusicMix::default()
+            },
+            true,
+            None,
+            24.0,
+            None,
+            "",
+            1.0,
+            None,
+            None,
+            false,
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        let (duration, _, _, _, audio) = probe(&output).await.unwrap();
+        assert!((duration - 1.5).abs() < 0.1);
+        assert!(audio);
+    }
+}
+
+#[cfg(test)]
+mod hdr_tests {
+    use super::*;
+
+    #[test]
+    fn hdr_sources_are_tone_mapped_never_copied() {
+        let hdr = serde_json::json!({ "streams": [
+            { "codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p", "width": 1280, "height": 720, "color_transfer": "arib-std-b67" },
+            { "codec_type": "audio", "codec_name": "aac" }
+        ]});
+        assert!(hdr_video(&hdr));
+        assert_eq!(import_plan(&hdr, Playable::default()), CopyPlan::Transcode);
+        let sdr = serde_json::json!({ "streams": [
+            { "codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p", "width": 1280, "height": 720, "color_transfer": "bt709" }
+        ]});
+        assert!(!hdr_video(&sdr));
+        let args = import_transcode_args("in.mp4", "out.mp4", &SOFTWARE_ENCODER, true);
+        assert!(args.contains(&IMPORT_HDR));
+        assert!(IMPORT_HDR.ends_with(IMPORT_SCALE));
+    }
+
+    #[tokio::test]
+    async fn an_hdr_clip_imports_as_standard_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("hdr.mp4");
+        run(
+            "ffmpeg",
+            &[
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:duration=1:rate=24",
+                "-vf",
+                "format=yuv420p10le",
+                "-c:v",
+                "libx264",
+                "-color_primaries",
+                "bt2020",
+                "-color_trc",
+                "smpte2084",
+                "-colorspace",
+                "bt2020nc",
+                "-y",
+                text(&source).unwrap(),
+            ],
+            60,
+        )
+        .await
+        .unwrap();
+        let (plan, hdr) = import_copy_plan(&source, Playable::default()).await;
+        assert_eq!((plan, hdr), (CopyPlan::Transcode, true));
+        let output = tmp.path().join("copy.mp4");
+        run(
+            "ffmpeg",
+            &import_transcode_args(
+                text(&source).unwrap(),
+                text(&output).unwrap(),
+                &SOFTWARE_ENCODER,
+                true,
+            ),
+            120,
+        )
+        .await
+        .unwrap();
+        let (_, standard) = import_copy_plan(&output, Playable::default()).await;
+        assert!(!standard);
+        let (duration, w, h, _, _) = probe(&output).await.unwrap();
+        assert!((duration - 1.0).abs() < 0.1);
+        assert_eq!((w, h), (320, 180));
+    }
+}
+
+#[cfg(test)]
+mod broll_tests {
+    use super::*;
+
+    fn sample() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../public/sample/alpine.mp4")
+    }
+
+    #[test]
+    fn b_roll_shows_over_its_stretch_in_a_corner_or_the_whole_frame() {
+        let parts = [
+            BRollPart {
+                path: sample(),
+                from: 10.0,
+                start: 0.5,
+                length: 1.0,
+                pip: None,
+                corner: String::new(),
+            },
+            BRollPart {
+                path: sample(),
+                from: 20.0,
+                start: 2.0,
+                length: 0.8,
+                pip: Some((144, 72)),
+                corner: "bottom-left".into(),
+            },
+        ];
+        let chain = broll_chain(&parts, 1, 360, 640, 24.0);
+        assert!(chain.starts_with("[bpre];[1:v]scale=360:640:force_original_aspect_ratio=increase"));
+        assert!(chain.contains("trim=duration=1.000,setpts=PTS-STARTPTS+0.500/TB[br0]"));
+        assert!(chain.contains("[2:v]scale=144:72:flags=lanczos"));
+        assert!(chain.contains("[bpre][br0]overlay=x=0:y=0:eof_action=pass:enable='between(t,0.500,1.500)'[bo0];[bo0][br1]overlay=x=14:y=554"));
+        assert!(!chain.ends_with(']'));
+        assert_eq!(pip_place(360, 640, (144, 72), "top-right"), (202, 14));
+    }
+
+    #[tokio::test]
+    async fn a_clip_with_b_roll_renders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("broll.mp4");
+        let filter = clip_filter("vertical", "fill", 1280, 640, CropPosition::default()).unwrap();
+        let parts = [
+            BRollPart {
+                path: sample(),
+                from: 10.0,
+                start: 0.3,
+                length: 0.8,
+                pip: None,
+                corner: String::new(),
+            },
+            BRollPart {
+                path: sample(),
+                from: 20.0,
+                start: 1.0,
+                length: 0.6,
+                pip: Some((144, 72)),
+                corner: "top-right".into(),
+            },
+        ];
+        render_captioned(
+            &sample(),
+            &output,
+            2.0,
+            4.0,
+            &filter,
+            false,
+            None,
+            360,
+            640,
+            None,
+            MusicMix::default(),
+            true,
+            None,
+            24.0,
+            None,
+            "",
+            1.0,
+            None,
+            None,
+            false,
+            &[],
+            &parts,
+        )
+        .await
+        .unwrap();
+        let (duration, w, h, _, audio) = probe(&output).await.unwrap();
+        assert!((duration - 2.0).abs() < 0.1, "{duration}");
+        assert_eq!((w, h, audio), (360, 640, true));
+    }
+}
+
+#[cfg(test)]
+mod text_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn text_layers_render_over_the_clip() {
+        let sample = Path::new(env!("CARGO_MANIFEST_DIR")).join("../public/sample/alpine.mp4");
+        let fonts = Path::new(env!("CARGO_MANIFEST_DIR")).join("../public/fonts");
+        let tmp = tempfile::tempdir().unwrap();
+        let shown: Vec<crate::texts::Shown> = ["pop", "type"]
+            .iter()
+            .enumerate()
+            .map(|(i, animation)| crate::texts::Shown {
+                request: crate::texts::TextRequest {
+                    text: "Above the clouds".into(),
+                    preset: if i == 0 { "title" } else { "cta" }.into(),
+                    at: 0.2,
+                    length: 1.2,
+                    x: 0.5,
+                    y: if i == 0 { 0.2 } else { 0.8 },
+                    animation: (*animation).into(),
+                    color: String::new(),
+                },
+                start: 0.2,
+                end: 1.4,
+            })
+            .collect();
+        let script = crate::texts::texts_ass(&shown, 360, 640).unwrap();
+        let folder = script_folder(&fonts, None, Some(&script)).await.unwrap();
+        assert!(!folder.path().join("captions.ass").exists());
+        let output = tmp.path().join("texts.mp4");
+        let filter = clip_filter("vertical", "fill", 1280, 640, CropPosition::default()).unwrap();
+        render_captioned(
+            &sample,
+            &output,
+            2.0,
+            3.5,
+            &filter,
+            false,
+            None,
+            360,
+            640,
+            None,
+            MusicMix::default(),
+            true,
+            None,
+            24.0,
+            None,
+            "",
+            1.0,
+            Some(folder.path()),
+            None,
+            false,
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        let (duration, w, h, _, _) = probe(&output).await.unwrap();
+        assert!((duration - 1.5).abs() < 0.1);
+        assert_eq!((w, h), (360, 640));
     }
 }

@@ -443,7 +443,7 @@ pub fn ass_text(text: &str) -> String {
         .collect()
 }
 
-fn ass_time(seconds: f64) -> String {
+pub(crate) fn ass_time(seconds: f64) -> String {
     let total = (seconds.max(0.0) * 100.0).round() as u64;
     let (whole, fraction) = (total / 100, total % 100);
     format!(
@@ -459,7 +459,7 @@ fn bgr(color: &str) -> String {
     format!("{}{}{}", &value[4..6], &value[2..4], &value[0..2])
 }
 /// A style colour field, &HAABBGGRR (alpha 0 is opaque).
-fn ass_colour(color: &str, alpha: u8) -> String {
+pub(crate) fn ass_colour(color: &str, alpha: u8) -> String {
     format!("&H{alpha:02X}{}", bgr(color))
 }
 /// An inline \c override, &HBBGGRR&.

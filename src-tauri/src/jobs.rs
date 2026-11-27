@@ -1,4 +1,4 @@
-use crate::{ai, media, media::Result};
+use crate::{ai, join, media, media::Result};
 use std::{future::Future, sync::Mutex};
 use tauri::{AppHandle, State};
 use tokio::sync::watch;
@@ -6,24 +6,72 @@ use tokio::sync::watch;
 #[derive(Default)]
 pub struct Jobs(Mutex<Option<watch::Sender<bool>>>);
 
-impl Jobs {
-    async fn process<T>(&self, future: impl Future<Output = Result<T>>) -> Result<T> {
-        let (send, mut cancel) = watch::channel(false);
-        {
-            let mut active = self.0.lock().map_err(|_| "Job state unavailable.")?;
-            if active.is_some() {
-                return Err("Wait for the active job to finish.".into());
-            }
-            *active = Some(send);
+struct Running<'a>(&'a Jobs);
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.0 .0.lock() {
+            *active = None;
         }
-        let result = tokio::select! {
+    }
+}
+
+impl Jobs {
+    fn start(&self) -> Result<(Running<'_>, watch::Receiver<bool>)> {
+        let (send, cancel) = watch::channel(false);
+        let mut active = self.0.lock().map_err(|_| "Job state unavailable.")?;
+        if active.is_some() {
+            return Err("Wait for the active job to finish.".into());
+        }
+        *active = Some(send);
+        Ok((Running(self), cancel))
+    }
+
+    async fn process<T>(&self, future: impl Future<Output = Result<T>>) -> Result<T> {
+        let (_running, mut cancel) = self.start()?;
+        tokio::select! {
             biased;
             _ = cancel.changed() => Err("Operation cancelled.".into()),
             value = future => value,
-        };
-        *self.0.lock().map_err(|_| "Job state unavailable.")? = None;
-        result
+        }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cancellable_batch_holds_the_job_slot_until_it_reports() {
+        let jobs = Jobs::default();
+        let (running, cancel) = jobs.start().unwrap();
+        assert!(jobs.start().is_err());
+        jobs.0.lock().unwrap().as_ref().unwrap().send(true).unwrap();
+        assert!(*cancel.borrow());
+        assert!(jobs.start().is_err());
+        drop(running);
+        assert!(jobs.start().is_ok());
+    }
+}
+
+/// Clips joined into one video, between an optional opening shot and end card.
+#[tauri::command]
+pub async fn export_joined(
+    app: AppHandle,
+    jobs: State<'_, Jobs>,
+    id: String,
+    requests: Vec<media::ExportRequest>,
+    transition: String,
+    intro: Option<String>,
+    outro: Option<String>,
+) -> Result<Option<String>> {
+    let (_running, cancel) = jobs.start()?;
+    join::export_joined(app, id, requests, transition, intro, outro, cancel).await
+}
+
+#[tauri::command]
+pub async fn pick_bookend(app: AppHandle) -> Result<Option<join::BookendFile>> {
+    join::pick_bookend(app).await
 }
 
 #[tauri::command]
@@ -71,9 +119,16 @@ pub async fn find_highlights(
     id: String,
     connection: crate::providers::Connection,
     model: String,
-) -> Result<Vec<ai::Suggestion>> {
-    jobs.process(ai::find_highlights(app, id, connection, model))
-        .await
+    options: Option<crate::highlights::SearchOptions>,
+) -> Result<Vec<crate::highlights::Pick>> {
+    jobs.process(ai::find_highlights(
+        app,
+        id,
+        connection,
+        model,
+        options.unwrap_or_default(),
+    ))
+    .await
 }
 
 /// Not a job: the waveform draws while the editor is in use, alongside other work.
@@ -127,35 +182,64 @@ pub async fn export_clip(
     end: f64,
     shape: String,
     fit: String,
+    crop: Option<media::CropPosition>,
     headline: String,
     voice: bool,
     music: String,
-    volume: f64,
+    volume: Option<f64>,
+    music_mix: Option<media::MusicMix>,
     pauses: bool,
     logo: String,
     corner: String,
     speed: f64,
     captions: Option<String>,
+    loudness: Option<i32>,
+    camera: Option<Vec<media::CropKey>>,
+    drops: Option<Vec<(f64, f64)>>,
+    zooms: Option<Vec<(f64, f64)>>,
+    broll: Option<Vec<media::BRollRequest>>,
+    texts: Option<Vec<crate::texts::TextRequest>>,
 ) -> Result<Option<String>> {
     jobs.process(media::export_clip(
         app,
         id,
-        title,
-        start,
-        end,
-        shape,
-        fit,
-        headline,
-        voice,
-        music,
-        volume,
-        pauses,
-        logo,
-        corner,
-        speed,
-        captions.unwrap_or_default(),
+        media::ExportRequest {
+            title,
+            start,
+            end,
+            shape,
+            fit,
+            crop: crop.unwrap_or_default(),
+            headline,
+            voice,
+            music,
+            music_mix: music_mix.or_else(|| volume.map(media::MusicMix::with_volume)),
+            pauses,
+            logo,
+            corner,
+            speed,
+            captions: captions.unwrap_or_default(),
+            loudness,
+            camera: camera.unwrap_or_default(),
+            drops: drops.unwrap_or_default(),
+            zooms: zooms.unwrap_or_default(),
+            video: None,
+            broll: broll.unwrap_or_default(),
+            texts: texts.unwrap_or_default(),
+        },
     ))
     .await
+}
+
+#[tauri::command]
+pub async fn export_batch(
+    app: AppHandle,
+    jobs: State<'_, Jobs>,
+    id: String,
+    requests: Vec<media::ExportRequest>,
+) -> Result<Option<media::BatchReport>> {
+    let (_running, cancel) = jobs.start()?;
+    media::export_batch(app, id, requests, cancel).await
 }
 
 #[tauri::command]

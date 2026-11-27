@@ -26,5 +26,14 @@ keyring = { version = "3.6.3", features = ["windows-native", "apple-native", "sy
 base64 = "0.22"
 tempfile = "3"
 
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Media_FaceAnalysis",
+    "Graphics_Imaging",
+    "Storage_Streams",
+    "Foundation",
+    "Win32_System_Com",
+] }
+
 [dev-dependencies]
 tiny_http = "0.12"
