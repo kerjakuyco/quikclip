@@ -33,7 +33,8 @@ test('clips join into one video, with a transition, an opening shot and an end c
         if (cmd === 'plugin:event|listen') return next++;
         if (cmd === 'pick_bookend')
           return { path: 'C:/library/bookends/intro.mp4', name: 'Brand intro', duration: 2.5 };
-        if (cmd === 'export_joined') return 'C:/out/joined.mp4';
+        if (cmd === 'pick_export_file') return 'C:/out/joined.mp4';
+        if (cmd === 'render_joined') return 'C:/out/joined.mp4';
         return null;
       },
     };
@@ -96,8 +97,8 @@ test('clips join into one video, with a transition, an opening shot and an end c
     'Brand intro · 00:02.50',
   );
   await page.getByRole('button', { name: 'Choose where to save · 3 clips joined' }).click();
-  await expect.poll(async () => (await calls(page, 'export_joined')).length).toBe(1);
-  const [joined] = (await calls(page, 'export_joined')) as {
+  await expect.poll(async () => (await calls(page, 'render_joined')).length).toBe(1);
+  const [joined] = (await calls(page, 'render_joined')) as {
     id: string;
     transition: string;
     intro: string | null;
@@ -109,12 +110,13 @@ test('clips join into one video, with a transition, an opening shot and an end c
     transition: 'fade',
     intro: 'C:/library/bookends/intro.mp4',
     outro: null,
+    target: 'C:/out/joined.mp4',
   });
   // In bin order, all in the one frame.
   expect(joined.requests.map((r) => r.title)).toEqual(['Opening', 'Later', 'End']);
   expect(new Set(joined.requests.map((r) => r.shape))).toEqual(new Set(['vertical']));
   await expect(
-    page.getByRole('status').filter({ hasText: '3 clips joined into one video' }),
+    page.getByRole('status').filter({ hasText: 'Rendered “Opening + 2 more”' }),
   ).toBeVisible();
   // The opening shot stays with the project.
   await page.reload();

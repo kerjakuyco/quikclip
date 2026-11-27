@@ -85,8 +85,10 @@ async function openDesktop(page: Page) {
               fps: 30,
               frames: ['C:/media/second/frame-0.jpg'],
             };
-          if (cmd === 'export_clip') return 'C:/out/clip.mp4';
-          if (cmd === 'export_batch')
+          if (cmd === 'pick_export_file') return 'C:/out/clip.mp4';
+          if (cmd === 'pick_export_folder') return 'C:/out';
+          if (cmd === 'render_clip') return 'C:/out/clip.mp4';
+          if (cmd === 'render_batch')
             return {
               folder: 'C:/out/batch',
               total: 2,
@@ -162,22 +164,25 @@ test('add a video to a project, cut and export from it, switch back, and remove 
   // A single export reads the second video; a batch reads each clip's own.
   await page.getByRole('button', { name: 'Export clip', exact: true }).click();
   await page.getByRole('button', { name: 'Choose destination' }).click();
-  await expect.poll(async () => (await calls(page, 'export_clip')).length).toBe(1);
-  expect((await calls(page, 'export_clip'))[0]).toMatchObject({ id: SECOND, end: 15 });
+  await expect.poll(async () => (await calls(page, 'render_clip')).length).toBe(1);
+  expect((await calls(page, 'render_clip'))[0]).toMatchObject({
+    id: PROJECT,
+    target: 'C:/out/clip.mp4',
+    request: { video: SECOND, end: 15 },
+  });
   await page.getByRole('button', { name: 'Export clip', exact: true }).click();
   await page.getByRole('group', { name: 'Clips to export' }).getByText('Opening').click();
   await page.getByRole('button', { name: /Choose a folder · 2 files/ }).click();
-  await expect.poll(async () => (await calls(page, 'export_batch')).length).toBe(1);
-  const batch = (await calls(page, 'export_batch'))[0] as {
+  await expect.poll(async () => (await calls(page, 'render_batch')).length).toBe(1);
+  const batch = (await calls(page, 'render_batch'))[0] as {
     id: string;
+    folder: string;
     requests: { video: string }[];
   };
+  expect(batch.folder).toBe('C:/out');
   expect(batch.requests.map((r) => r.video).sort()).toEqual([PROJECT, SECOND].sort());
   // Back to the first video.
-  await page
-    .getByRole('button', { name: 'Close dialog' })
-    .click()
-    .catch(() => {});
+  await expect(page.getByRole('dialog')).toHaveCount(0);
   await page.getByRole('button', { name: /Second\s*2\/2/ }).click();
   await page
     .getByRole('group', { name: 'Project videos' })

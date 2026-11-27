@@ -64,7 +64,9 @@ async function openDesktop(page: Page) {
           if (cmd === 'plugin:event|listen') return next++;
           if (cmd === 'read_transcript') return { language: 'en', segments: [], words };
           if (cmd === 'pick_music') return { path: 'C:/music/bed.mp3', name: 'Bed', duration: 30 };
-          if (cmd === 'export_clip') return 'C:/out/clip.mp4';
+          if (cmd === 'pick_export_file') return 'C:/out/clip.mp4';
+          if (cmd === 'pick_export_folder') return 'C:/out';
+          if (cmd === 'render_clip') return 'C:/out/clip.mp4';
           return null;
         },
       };
@@ -120,8 +122,9 @@ async function seekTo(page: Page, time: number) {
 async function exportOnce(page: Page, count: number) {
   await page.getByRole('button', { name: 'Export clip', exact: true }).click();
   await page.getByRole('button', { name: 'Choose destination' }).click();
-  await expect.poll(async () => (await calls(page, 'export_clip')).length).toBe(count);
-  return (await calls(page, 'export_clip'))[count - 1] as Record<string, unknown>;
+  await expect.poll(async () => (await calls(page, 'render_clip')).length).toBe(count);
+  return ((await calls(page, 'render_clip'))[count - 1] as { request: Record<string, unknown> })
+    .request;
 }
 
 test('cuts ums, punches in on every other sentence, splits the frame, and ducks music', async ({

@@ -396,6 +396,11 @@ test('edit and persist a cut, then render the selected range', async ({ page }) 
   await page.reload();
   await expect(page.getByLabel('In point', { exact: true })).toHaveValue('00:13.00');
   await expect(page.getByLabel('Out point', { exact: true })).toHaveValue('00:14.50');
+  // The settings tab stays as it was left (Audio); the frame is under Frame.
+  await expect(
+    page.getByRole('tablist', { name: 'Clip settings' }).getByRole('tab', { name: 'Audio' }),
+  ).toHaveAttribute('aria-selected', 'true');
+  await openClipTools(page, 'Frame');
   await expect(page.getByRole('button', { name: '9:16', exact: true })).toHaveAttribute(
     'aria-pressed',
     'true',
@@ -739,7 +744,7 @@ test('the audio mixer keeps its settings and exports a non-looping music bed ove
   await page.getByRole('slider', { name: 'Fade out' }).press('Home');
   await page.getByLabel('Start in track').fill('0.1');
   await page.getByLabel('Start in track').press('Enter');
-  await page.getByRole('checkbox', { name: 'Loop track' }).uncheck();
+  await page.getByRole('switch', { name: 'Loop track' }).uncheck();
 
   await page.reload();
   await openClipTools(page, 'Audio');
@@ -747,7 +752,7 @@ test('the audio mixer keeps its settings and exports a non-looping music bed ove
   await expect(page.getByRole('slider', { name: 'Fade in' })).toHaveValue('0');
   await expect(page.getByRole('slider', { name: 'Fade out' })).toHaveValue('0');
   await expect(page.getByRole('slider', { name: 'Music volume' })).toHaveValue('100');
-  await expect(page.getByRole('checkbox', { name: 'Loop track' })).not.toBeChecked();
+  await expect(page.getByRole('switch', { name: 'Loop track' })).not.toBeChecked();
   await expect.poll(() => page.locator('video').evaluate((el) => el.volume)).toBe(0);
   await page.getByRole('button', { name: 'Export clip', exact: true }).click();
   const error = page.getByRole('dialog', { name: 'Export clip' }).getByRole('alert');
@@ -1035,7 +1040,20 @@ test('every desktop video is transcribed and its clips get captions and a transc
               title: 'Look under the clouds',
               start: 0.5,
               end: 4.2,
-              highlight: { score: 86, reason: 'The opening sets up a clear visual payoff.' },
+              approved: true,
+              highlight: {
+                score: 86,
+                reason: 'The opening sets up a clear visual payoff.',
+                parts: { hook: 90, clarity: 84, emotion: 72, payoff: 88 },
+                opening: 'Look under the clouds',
+              },
+            },
+            {
+              title: 'A quieter ridge',
+              start: 5,
+              end: 9,
+              approved: false,
+              highlight: { score: 61, reason: 'Pretty, but slow to start.' },
             },
           ];
         return null;
@@ -1159,30 +1177,47 @@ test('every desktop video is transcribed and its clips get captions and a transc
 
   await page.getByRole('button', { name: 'Find highlights', exact: true }).click();
   const finder = page.getByRole('dialog', { name: 'Highlight finder' });
-  const count = finder.getByRole('group', { name: 'Maximum highlights' });
-  await count.getByRole('button', { name: '5', exact: true }).click();
+  const count = finder.getByRole('group', { name: 'Highlights to find' });
+  await count.getByRole('button', { name: '12', exact: true }).click();
   await finder
-    .getByRole('group', { name: 'Maximum clip length' })
-    .getByRole('button', { name: '30 s' })
+    .getByRole('group', { name: 'Clip length' })
+    .getByRole('button', { name: 'Up to 30 seconds' })
     .click();
   await finder.getByRole('button', { name: 'Analyze source' }).click();
+  // The moments come first, scored, to pick from: the review's pick ticked, the near-miss not.
+  const picked = finder.getByRole('region', { name: 'Picked by the review' });
+  await expect(picked.getByRole('checkbox', { name: /Look under the clouds/ })).toHaveAttribute(
+    'aria-checked',
+    'true',
+  );
+  await expect(picked).toContainText('Opens with “Look under the clouds…”');
+  await expect(picked).toContainText('Hook90');
+  const also = finder.getByRole('region', { name: 'Also considered' });
+  await expect(also.getByRole('checkbox', { name: /A quieter ridge/ })).toHaveAttribute(
+    'aria-checked',
+    'false',
+  );
+  await finder.getByRole('button', { name: 'Add 1 clip' }).click();
   await expect(finder).toBeHidden();
   await expect(
     page.getByRole('button', { name: /Look under the clouds.*86 out of 100/ }),
   ).toHaveAttribute('aria-pressed', 'true');
   await expect(page.getByText('The opening sets up a clear visual payoff.')).toBeVisible();
+  // The clip keeps its score card.
+  await expect(page.locator('.score-card')).toContainText('AI suggestion · 86/100');
+  await expect(page.locator('.score-card')).toContainText('Payoff88');
   const options = await page.evaluate(
     () =>
       (window as unknown as { __calls: [string, { options?: unknown }][] }).__calls.find(
         ([cmd]) => cmd === 'find_highlights',
       )?.[1].options,
   );
-  expect(options).toEqual({ count: 5, maxSeconds: 30 });
+  expect(options).toEqual({ count: 12, maxSeconds: 30 });
   await page.reload();
   await expect(snap).toHaveAttribute('data-value', 'words');
   await expect(page.getByText('The opening sets up a clear visual payoff.')).toBeVisible();
   await page.getByRole('button', { name: 'Find highlights', exact: true }).click();
-  await expect(count.getByRole('button', { name: '5', exact: true })).toHaveAttribute(
+  await expect(count.getByRole('button', { name: '12', exact: true })).toHaveAttribute(
     'aria-pressed',
     'true',
   );

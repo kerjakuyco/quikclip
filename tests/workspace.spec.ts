@@ -156,7 +156,10 @@ test('zooms and pans the same source-time window for the ruler, media tracks, an
   const timeline = page.getByRole('region', { name: 'Timeline' });
   const pan = timeline.getByRole('slider', { name: 'Pan timeline' });
   const tracks = timeline.locator('.tracks');
-  await page.getByRole('button', { name: /Into the valley/ }).click();
+  await page
+    .getByRole('group', { name: 'Clips' })
+    .getByRole('button', { name: /Into the valley/ })
+    .click();
   await timeline.getByRole('button', { name: 'Fit clip' }).click();
   await expect(pan).toHaveAttribute('aria-valuetext', '00:10.80 to 00:25.20');
   const waveform = timeline.getByRole('img', { name: 'Source audio waveform' });
@@ -350,8 +353,9 @@ test('the clip settings tabs stay in view while their settings scroll', async ({
   await list.evaluate((el) => (el.scrollTop = el.scrollHeight));
   const box = (await tabs.boundingBox())!;
   const view = (await list.boundingBox())!;
-  expect(box.y).toBeGreaterThanOrEqual(view.y - 1);
-  expect(box.y).toBeLessThan(view.y + 12);
+  // Stuck a step (12 px) below the panel's own tabs.
+  expect(box.y).toBeGreaterThanOrEqual(view.y + 11);
+  expect(box.y).toBeLessThan(view.y + 16);
 });
 
 test('the phone layout keeps workspace navigation and actions reachable without horizontal scrolling', async ({

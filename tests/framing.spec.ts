@@ -45,7 +45,9 @@ async function openDesktop(page: Page, shape = 'vertical') {
               time: i * 0.5,
               faces: [{ x: i * 0.5 < 5 ? 0.05 : 0.8, y: 0.3, w: 0.12, h: 0.2 }],
             }));
-          if (cmd === 'export_clip') return 'C:/out/clip.mp4';
+          if (cmd === 'pick_export_file') return 'C:/out/clip.mp4';
+          if (cmd === 'pick_export_folder') return 'C:/out';
+          if (cmd === 'render_clip') return 'C:/out/clip.mp4';
           return null;
         },
       };
@@ -130,11 +132,13 @@ test('follows faces in the preview and exports the calm camera with the loudness
     summary.locator('div', { has: page.locator('dt', { hasText: 'Loudness' }) }).locator('dd'),
   ).toHaveText('Loud · -14 LUFS');
   await page.getByRole('button', { name: 'Choose destination' }).click();
-  await expect.poll(async () => (await calls(page, 'export_clip')).length).toBe(1);
-  const [request] = (await calls(page, 'export_clip')) as {
-    camera: { t: number; x: number; y: number }[];
-    loudness: number;
-    crop: { x: number; y: number };
+  await expect.poll(async () => (await calls(page, 'render_clip')).length).toBe(1);
+  const [{ request }] = (await calls(page, 'render_clip')) as {
+    request: {
+      camera: { t: number; x: number; y: number }[];
+      loudness: number;
+      crop: { x: number; y: number };
+    };
   }[];
   expect(request.loudness).toBe(-14);
   expect(request.camera.length).toBeGreaterThan(2);
@@ -147,11 +151,12 @@ test('follows faces in the preview and exports the calm camera with the loudness
   await framing.getByRole('button', { name: 'Center' }).click();
   await page.getByRole('button', { name: 'Export clip', exact: true }).click();
   await page.getByRole('button', { name: 'Choose destination' }).click();
-  await expect.poll(async () => (await calls(page, 'export_clip')).length).toBe(2);
-  const centered = (await calls(page, 'export_clip'))[1] as {
-    camera: unknown[];
-    crop: { x: number; y: number };
-  };
+  await expect.poll(async () => (await calls(page, 'render_clip')).length).toBe(2);
+  const centered = (
+    (await calls(page, 'render_clip'))[1] as {
+      request: { camera: unknown[]; crop: { x: number; y: number } };
+    }
+  ).request;
   expect(centered.crop).toEqual({ x: 50, y: 50 });
   expect(centered.camera).toEqual([]);
 });

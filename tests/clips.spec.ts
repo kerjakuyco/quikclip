@@ -72,8 +72,12 @@ test('filters the clip bin and shows safe areas on a vertical frame', async ({ p
   await page.goto('/');
   await expect(page.getByRole('heading', { name: 'Alpine field notes' })).toBeVisible();
   await page.getByLabel('Search clips').fill('valley');
-  await expect(page.getByRole('button', { name: /Into the valley/ })).toBeVisible();
-  await expect(page.getByRole('button', { name: /Still waters/ })).toHaveCount(0);
+  await expect(
+    page.getByRole('group', { name: 'Clips' }).getByRole('button', { name: /Into the valley/ }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole('group', { name: 'Clips' }).getByRole('button', { name: /Still waters/ }),
+  ).toHaveCount(0);
   await expect(page.locator('.count')).toHaveText('1 of 3');
   // The bands count what the search leaves.
   const lengths = page.getByRole('group', { name: 'Clip length' });
